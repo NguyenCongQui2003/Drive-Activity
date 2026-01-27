@@ -364,15 +364,57 @@ public class DriveRecoveryService {
             String parentName = getParentFolderName(fileLocation);
             result.movedFrom = parentName + " (" + userEmail + ")";
 
+// ✅ Thử move với current user token
             try {
+                Drive currentUserDrive = createDriveServiceForUserWithRetry(userEmail);
+
                 System.out.println("    ➡️  Đang move file về " + targetFolderPath + "...");
-                moveFileToFolder(file.id, fileLocation.getParents(), targetFolderId, driveService);
-                result.success = true;
-                System.out.println("    ✅ Đã move thành công từ: " + parentName);
+                MoveResult moveResult = moveFileToFolder(file.id, fileLocation.getParents(),
+                        targetFolderId, currentUserDrive);
+
+                if (moveResult.success) {
+                    result.success = true;
+                    result.reason = "Success";
+                    System.out.println("    ✅ Đã move thành công từ: " + parentName);
+                    return result;
+                }
+
+                // ✅ FALLBACK: Thử với owner token
+                System.out.println("    ⚠️  Move với user token thất bại: " + moveResult.reason);
+                System.out.println("    🔄 Thử move với owner token...");
+
+                if (fileLocation.getOwners() != null && !fileLocation.getOwners().isEmpty()) {
+                    String ownerEmail = fileLocation.getOwners().get(0).getEmailAddress();
+
+                    try {
+                        Drive ownerDrive = createDriveServiceForUserWithRetry(ownerEmail);
+
+                        MoveResult ownerMoveResult = moveFileToFolder(file.id, fileLocation.getParents(),
+                                targetFolderId, ownerDrive);
+
+                        if (ownerMoveResult.success) {
+                            result.success = true;
+                            result.reason = "Success (dùng quyền owner)";
+                            result.movedFrom = parentName + " (dùng quyền " + ownerEmail + ")";
+                            System.out.println("    ✅ Đã move bằng owner token");
+                            return result;
+                        } else {
+                            result.reason = "Lỗi move (cả user lẫn owner): " + ownerMoveResult.reason;
+                            System.out.println("    ❌ Move thất bại: " + ownerMoveResult.reason);
+                            return result;
+                        }
+                    } catch (Exception e) {
+                        result.reason = "Không lấy được owner token: " + e.getMessage();
+                        return result;
+                    }
+                }
+
+                result.reason = "Lỗi move: " + moveResult.reason;
                 return result;
-            } catch (Exception moveEx) {
-                result.reason = "Lỗi move: " + moveEx.getMessage();
-                System.out.println("    ❌ Lỗi khi move: " + moveEx.getMessage());
+
+            } catch (Exception e) {
+                result.reason = "Không tạo được Drive service: " + e.getMessage();
+                System.out.println("    ❌ Lỗi: " + e.getMessage());
                 return result;
             }
         }
@@ -429,17 +471,52 @@ public class DriveRecoveryService {
                         String parentName = getParentFolderName(foundFile);
                         result.movedFrom = parentName + " (" + otherUserEmail + ")";
 
-                        try {
-                            System.out.println("    ➡️  Đang move file về " + targetFolderPath + "...");
-                            moveFileToFolder(file.id, foundFile.getParents(), targetFolderId, userDriveService);
+                        // ✅ THAY BẰNG:
+                        // Trong phần tìm thấy file ở user khác (line ~572)
+                        System.out.println("    ➡️  Đang move file về " + targetFolderPath + "...");
+
+// ✅ BƯỚC 1: Thử move với userDriveService
+                        MoveResult moveResult = moveFileToFolder(file.id, foundFile.getParents(),
+                                targetFolderId, userDriveService);
+
+                        if (moveResult.success) {
                             result.success = true;
+                            result.reason = "Success";
                             System.out.println("    ✅ Đã move thành công từ: " + otherUserEmail);
                             return result;
-                        } catch (Exception moveEx) {
-                            result.reason = "Lỗi move: " + moveEx.getMessage();
-                            System.out.println("    ❌ Lỗi khi move: " + moveEx.getMessage());
-                            return result;
                         }
+
+// ✅ BƯỚC 2: FALLBACK - Thử với owner token
+                        System.out.println("    ⚠️  Move với user token thất bại: " + moveResult.reason);
+                        System.out.println("    🔄 Thử move với owner token...");
+
+                        if (foundFile.getOwners() != null && !foundFile.getOwners().isEmpty()) {
+                            String ownerEmail = foundFile.getOwners().get(0).getEmailAddress();
+
+                            try {
+                                Drive ownerDriveService = createDriveServiceForUserWithRetry(ownerEmail);
+
+                                MoveResult ownerMoveResult = moveFileToFolder(file.id, foundFile.getParents(),
+                                        targetFolderId, ownerDriveService);
+
+                                if (ownerMoveResult.success) {
+                                    result.success = true;
+                                    result.reason = "Success (dùng quyền owner)";
+                                    result.movedFrom = parentName + " (" + ownerEmail + ")";
+                                    System.out.println("    ✅ Đã move bằng owner token: " + ownerEmail);
+                                    return result;
+                                } else {
+                                    result.reason = "Lỗi move (cả user lẫn owner): " + ownerMoveResult.reason;
+                                    return result;
+                                }
+                            } catch (Exception e) {
+                                result.reason = "Không lấy được owner token: " + e.getMessage();
+                                return result;
+                            }
+                        }
+
+                        result.reason = "Move thất bại: " + moveResult.reason;
+                        return result;
                     }
                 } catch (com.google.api.client.googleapis.json.GoogleJsonResponseException e) {
                     int statusCode = e.getStatusCode();
@@ -747,17 +824,70 @@ public class DriveRecoveryService {
         return parts.length > 0 ? parts[parts.length - 1] : null;
     }
 
-    private void moveFileToFolder(String fileId, List<String> currentParents, String targetFolderId, Drive driveService) throws IOException {
-        String removeParents = currentParents != null && !currentParents.isEmpty()
-                ? String.join(",", currentParents)
-                : "";
+    /**
+     * ✅ FIXED: Move file VÀ VERIFY kết quả (giống Apps Script)
+     */
+    private MoveResult moveFileToFolder(String fileId, List<String> currentParents,
+                                        String targetFolderId, Drive driveService) {
+        MoveResult result = new MoveResult();
+        result.success = false;
 
-        driveService.files().update(fileId, null)
-                .setAddParents(targetFolderId)
-                .setRemoveParents(removeParents)
-                .setSupportsAllDrives(true)
-                .setFields("id, parents")
-                .execute();
+        try {
+            String removeParents = currentParents != null && !currentParents.isEmpty()
+                    ? String.join(",", currentParents)
+                    : "";
+
+            // ✅ BƯỚC 1: Execute move
+            File response = driveService.files().update(fileId, null)
+                    .setAddParents(targetFolderId)
+                    .setRemoveParents(removeParents)
+                    .setSupportsAllDrives(true)
+                    .setFields("id, parents")
+                    .execute();
+
+            // ✅ BƯỚC 2: Đợi Drive sync (giống Apps Script)
+            try {
+                Thread.sleep(500);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+
+            // ✅ BƯỚC 3: VERIFY file đã move chưa
+            File verifyFile = driveService.files().get(fileId)
+                    .setFields("id, name, parents")
+                    .setSupportsAllDrives(true)
+                    .execute();
+
+            // ✅ BƯỚC 4: KIỂM TRA file có trong target folder chưa
+            if (verifyFile.getParents() != null &&
+                    verifyFile.getParents().contains(targetFolderId)) {
+
+                System.out.println("    ✅ Move SUCCESS - Verified");
+                result.success = true;
+                result.reason = "Success";
+                return result;
+
+            } else {
+                System.out.println("    ❌ Move FAILED - File not in target folder");
+                System.out.println("    Current parents: " + verifyFile.getParents());
+                result.reason = "File not in target folder after move";
+                return result;
+            }
+
+        } catch (com.google.api.client.googleapis.json.GoogleJsonResponseException e) {
+            int statusCode = e.getStatusCode();
+            String errorMsg = e.getDetails() != null ? e.getDetails().getMessage() : e.getMessage();
+
+            System.out.println("    ❌ Move FAILED (" + statusCode + "): " + errorMsg);
+
+            result.reason = "HTTP " + statusCode + ": " + errorMsg;
+            return result;
+
+        } catch (Exception e) {
+            System.out.println("    ❌ Move EXCEPTION: " + e.getMessage());
+            result.reason = e.getMessage();
+            return result;
+        }
     }
 
     private List<File> getCurrentFilesInFolder(String folderId, String userEmail) throws IOException {
@@ -1253,10 +1383,22 @@ public class DriveRecoveryService {
     // INNER CLASSES
     // ============================================
 
+//    static class MoveResult {
+//        boolean success;
+//        String reason;
+//        String movedFrom;
+//    }
+
     static class MoveResult {
         boolean success;
         String reason;
         String movedFrom;
+
+        MoveResult() {
+            this.success = false;
+            this.reason = "";
+            this.movedFrom = "";
+        }
     }
 
     static class FolderInfo {
@@ -1289,6 +1431,8 @@ public class DriveRecoveryService {
         String lastSeen;
         CurrentStatus currentStatus; // ⭐ NEW
     }
+
+
 
     /**
      * ⭐ NEW: Current Status class

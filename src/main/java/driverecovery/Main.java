@@ -23,6 +23,7 @@ public class Main {
     private static final String MODE_NORMAL = "1";
     private static final String MODE_DETAILED_ACTIVITY = "2";
 
+
     public static void main(String[] args) {
         System.out.println("========================================");
         System.out.println("   DRIVE RECOVERY TOOL");
