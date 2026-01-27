@@ -1035,6 +1035,643 @@ public class DetailedActivityService {
         sheet.createFreezePane(0, 1);  // Freeze 1 row đầu tiên
     }
 
+    /**
+     * 🆕 Phân tích TẤT CẢ FOLDERS của 1 USER
+     */
+    public String analyzeAllFoldersForUser(String userEmail) throws Exception {
+        System.out.println("👤 Đang phân tích user: " + userEmail);
+
+        // Lấy tất cả folders
+        System.out.println("\n📂 Đang quét tất cả folders...");
+        List<FolderInfo> allFolders = getAllFoldersRecursiveForService(userEmail);
+        System.out.println("✓ Tìm thấy " + allFolders.size() + " folders\n");
+
+        List<FolderDetailedReport> allReports = new ArrayList<>();
+
+        for (int i = 0; i < allFolders.size(); i++) {
+            FolderInfo folder = allFolders.get(i);
+
+            System.out.println("\n[" + (i + 1) + "/" + allFolders.size() + "] " + folder.path);
+
+            try {
+                System.out.println("  📋 Đang đọc Activity...");
+                List<com.google.api.services.driveactivity.v2.model.DriveActivity> activities =
+                        getActivityForFolder(folder.id);
+
+                if (activities.isEmpty()) {
+                    System.out.println("  ℹ️  Không có activity");
+                    continue;
+                }
+
+                System.out.println("  ✓ Có " + activities.size() + " activities");
+                System.out.println("  🔍 Đang phân tích...");
+
+                DetailedLog detailedLog = analyzeDetailedActivity(activities, folder.id);
+
+                FolderDetailedReport report = new FolderDetailedReport();
+                report.folderInfo = folder;
+                report.detailedLog = detailedLog;
+
+                allReports.add(report);
+                System.out.println("  ✅ Hoàn thành");
+
+            } catch (Exception e) {
+                System.err.println("  ❌ Lỗi: " + e.getMessage());
+            }
+        }
+
+        System.out.println("\n📊 Đang tạo báo cáo...");
+        String reportPath = createConsolidatedReport(allReports, userEmail);
+
+        return reportPath;
+    }
+
+    /**
+     * 🆕 Phân tích TẤT CẢ FOLDERS của TẤT CẢ USERS
+     */
+    public String analyzeAllFoldersForAllUsers(java.util.List<String> allUsers) throws Exception {
+        System.out.println("👥 Đang phân tích " + allUsers.size() + " users");
+
+        java.util.Map<String, java.util.List<FolderDetailedReport>> allUserReports = new java.util.LinkedHashMap<>();
+
+        for (int userIndex = 0; userIndex < allUsers.size(); userIndex++) {
+            String userEmail = allUsers.get(userIndex);
+
+            System.out.println("\n╔════════════════════════════════════════");
+            System.out.println("║ USER " + (userIndex + 1) + "/" + allUsers.size() + ": " + userEmail);
+            System.out.println("╚════════════════════════════════════════");
+
+            try {
+                // Tạo service cho user
+                Drive userDrive = createDriveServiceForUser(userEmail);
+                DriveActivity userActivity = createActivityServiceForUser(userEmail);
+
+                DetailedActivityService userService = new DetailedActivityService(
+                        userDrive,
+                        userActivity
+                );
+
+                // Lấy folders
+                System.out.println("\n📂 Đang quét folders...");
+                java.util.List<FolderInfo> folders = userService.getAllFoldersRecursiveForService(userEmail);
+                System.out.println("✓ Tìm thấy " + folders.size() + " folders");
+
+                java.util.List<FolderDetailedReport> userReports = new java.util.ArrayList<>();
+
+                for (int i = 0; i < folders.size(); i++) {
+                    FolderInfo folder = folders.get(i);
+                    System.out.println("  [" + (i + 1) + "/" + folders.size() + "] " + folder.path);
+
+                    try {
+                        java.util.List<com.google.api.services.driveactivity.v2.model.DriveActivity> activities =
+                                userService.getActivityForFolder(folder.id);
+
+                        if (activities.isEmpty()) continue;
+
+                        DetailedLog log = userService.analyzeDetailedActivity(activities, folder.id);
+
+                        FolderDetailedReport report = new FolderDetailedReport();
+                        report.folderInfo = folder;
+                        report.detailedLog = log;
+                        userReports.add(report);
+
+                    } catch (Exception e) {
+                        System.err.println("    ❌ Lỗi: " + e.getMessage());
+                    }
+                }
+
+                allUserReports.put(userEmail, userReports);
+                System.out.println("\n✅ Hoàn thành user: " + userEmail);
+
+            } catch (Exception e) {
+                System.err.println("\n❌ Lỗi " + userEmail + ": " + e.getMessage());
+            }
+        }
+
+        System.out.println("\n📊 Đang tạo báo cáo tổng hợp...");
+        String reportPath = createOrganizationReport(allUserReports);
+
+        return reportPath;
+    }
+
+    /**
+     * 🆕 Helper: Quét folders (dùng cho service)
+     */
+    private java.util.List<FolderInfo> getAllFoldersRecursiveForService(String userEmail) throws IOException {
+        java.util.List<FolderInfo> result = new java.util.ArrayList<>();
+        java.util.List<File> rootFolders = getFoldersInParentForService("root");
+
+        for (File folder : rootFolders) {
+            FolderInfo info = new FolderInfo();
+            info.id = folder.getId();
+            info.name = folder.getName();
+            info.path = "/" + folder.getName();
+            result.add(info);
+
+            result.addAll(getFoldersRecursiveHelperForService(folder.getId(), info.path));
+        }
+
+        return result;
+    }
+
+    private java.util.List<FolderInfo> getFoldersRecursiveHelperForService(String parentId, String parentPath) throws IOException {
+        java.util.List<FolderInfo> result = new java.util.ArrayList<>();
+        java.util.List<File> childFolders = getFoldersInParentForService(parentId);
+
+        for (File folder : childFolders) {
+            FolderInfo info = new FolderInfo();
+            info.id = folder.getId();
+            info.name = folder.getName();
+            info.path = parentPath + "/" + folder.getName();
+            result.add(info);
+
+            result.addAll(getFoldersRecursiveHelperForService(folder.getId(), info.path));
+        }
+
+        return result;
+    }
+
+    private java.util.List<File> getFoldersInParentForService(String parentId) throws IOException {
+        java.util.List<File> folders = new java.util.ArrayList<>();
+        String pageToken = null;
+
+        do {
+            String query = "'" + parentId + "' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false";
+            com.google.api.services.drive.model.FileList result = driveService.files().list()
+                    .setQ(query)
+                    .setFields("nextPageToken, files(id, name)")
+                    .setPageSize(1000)
+                    .setPageToken(pageToken)
+                    .execute();
+
+            if (result.getFiles() != null) {
+                folders.addAll(result.getFiles());
+            }
+            pageToken = result.getNextPageToken();
+        } while (pageToken != null);
+
+        return folders;
+    }
+
+    /**
+     * 🆕 Helper: Tạo Drive/Activity service cho user
+     */
+    private Drive createDriveServiceForUser(String userEmail) throws Exception {
+        com.google.auth.oauth2.GoogleCredentials credentials;
+
+        if (Config.USE_JSON_FILE) {
+            credentials = com.google.auth.oauth2.ServiceAccountCredentials
+                    .fromStream(new java.io.FileInputStream(Config.SERVICE_ACCOUNT_FILE))
+                    .createScoped(Config.SCOPES)
+                    .createDelegated(userEmail);
+        } else {
+            credentials = com.google.auth.oauth2.ServiceAccountCredentials
+                    .fromStream(new java.io.ByteArrayInputStream(
+                            createServiceAccountJson().getBytes(java.nio.charset.StandardCharsets.UTF_8)))
+                    .createScoped(Config.SCOPES)
+                    .createDelegated(userEmail);
+        }
+
+        return new Drive.Builder(
+                com.google.api.client.googleapis.javanet.GoogleNetHttpTransport.newTrustedTransport(),
+                com.google.api.client.json.gson.GsonFactory.getDefaultInstance(),
+                new com.google.auth.http.HttpCredentialsAdapter(credentials)
+        )
+                .setApplicationName("Drive Recovery Tool v2.0")
+                .build();
+    }
+
+    private DriveActivity createActivityServiceForUser(String userEmail) throws Exception {
+        com.google.auth.oauth2.GoogleCredentials credentials;
+
+        if (Config.USE_JSON_FILE) {
+            credentials = com.google.auth.oauth2.ServiceAccountCredentials
+                    .fromStream(new java.io.FileInputStream(Config.SERVICE_ACCOUNT_FILE))
+                    .createScoped(Config.SCOPES)
+                    .createDelegated(userEmail);
+        } else {
+            credentials = com.google.auth.oauth2.ServiceAccountCredentials
+                    .fromStream(new java.io.ByteArrayInputStream(
+                            createServiceAccountJson().getBytes(java.nio.charset.StandardCharsets.UTF_8)))
+                    .createScoped(Config.SCOPES)
+                    .createDelegated(userEmail);
+        }
+
+        return new DriveActivity.Builder(
+                com.google.api.client.googleapis.javanet.GoogleNetHttpTransport.newTrustedTransport(),
+                com.google.api.client.json.gson.GsonFactory.getDefaultInstance(),
+                new com.google.auth.http.HttpCredentialsAdapter(credentials)
+        )
+                .setApplicationName("Drive Recovery Tool v2.0")
+                .build();
+    }
+
+    private String createServiceAccountJson() {
+        String privateKeyId = (Config.PRIVATE_KEY_ID != null && !Config.PRIVATE_KEY_ID.isEmpty())
+                ? Config.PRIVATE_KEY_ID : "0";
+        String clientId = (Config.CLIENT_ID != null && !Config.CLIENT_ID.isEmpty())
+                ? Config.CLIENT_ID : "0";
+
+        return String.format(
+                "{\n" +
+                        "  \"type\": \"service_account\",\n" +
+                        "  \"project_id\": \"%s\",\n" +
+                        "  \"private_key_id\": \"%s\",\n" +
+                        "  \"private_key\": \"%s\",\n" +
+                        "  \"client_email\": \"%s\",\n" +
+                        "  \"client_id\": \"%s\",\n" +
+                        "  \"auth_uri\": \"https://accounts.google.com/o/oauth2/auth\",\n" +
+                        "  \"token_uri\": \"https://oauth2.googleapis.com/token\",\n" +
+                        "  \"auth_provider_x509_cert_url\": \"https://www.googleapis.com/oauth2/v1/certs\"\n" +
+                        "}",
+                Config.PROJECT_ID,
+                privateKeyId,
+                Config.PRIVATE_KEY.replace("\n", "\\n"),
+                Config.SERVICE_ACCOUNT_EMAIL,
+                clientId
+        );
+    }
+
+    /**
+     * 🆕 Tạo báo cáo tổng hợp cho 1 user
+     */
+    private String createConsolidatedReport(java.util.List<FolderDetailedReport> reports, String userEmail) throws IOException {
+        String timestamp = new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date());
+        String fileName = "detailed-activity-" + userEmail.split("@")[0] + "-ALL-FOLDERS-" + timestamp + ".xlsx";
+
+        java.io.File outputDir = new java.io.File(Config.OUTPUT_DIRECTORY);
+        if (!outputDir.exists()) {
+            outputDir.mkdirs();
+        }
+
+        String fullPath = Config.OUTPUT_DIRECTORY + fileName;
+        Workbook workbook = new XSSFWorkbook();
+
+        // Summary sheet
+        createConsolidatedSummarySheet(workbook, reports, userEmail);
+
+        // Chi tiết từng folder (tối đa 10)
+        int sheetCount = 0;
+        for (int i = 0; i < reports.size() && sheetCount < 10; i++) {
+            FolderDetailedReport report = reports.get(i);
+
+            if (report.detailedLog.activityLog.isEmpty()) continue;
+
+            sheetCount++;
+            Sheet sheet = workbook.createSheet("Folder_" + sheetCount);
+            createFolderDetailSheetSimple(sheet, report, workbook);
+        }
+
+        try (FileOutputStream out = new FileOutputStream(fullPath)) {
+            workbook.write(out);
+        }
+        workbook.close();
+
+        return new java.io.File(fullPath).getAbsolutePath();
+    }
+
+    /**
+     * 🆕 Tạo báo cáo tổ chức
+     */
+    private String createOrganizationReport(java.util.Map<String, java.util.List<FolderDetailedReport>> allUserReports) throws IOException {
+        String timestamp = new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date());
+        String fileName = "detailed-activity-ORGANIZATION-" + timestamp + ".xlsx";
+
+        java.io.File outputDir = new java.io.File(Config.OUTPUT_DIRECTORY);
+        if (!outputDir.exists()) {
+            outputDir.mkdirs();
+        }
+
+        String fullPath = Config.OUTPUT_DIRECTORY + fileName;
+        Workbook workbook = new XSSFWorkbook();
+
+        // Summary tổ chức
+        createOrganizationSummarySheet(workbook, allUserReports);
+
+        // Sheet cho từng user (tối đa 20)
+        int userCount = 0;
+        for (java.util.Map.Entry<String, java.util.List<FolderDetailedReport>> entry : allUserReports.entrySet()) {
+            if (userCount >= 20) break;
+
+            String userEmail = entry.getKey();
+            java.util.List<FolderDetailedReport> userReports = entry.getValue();
+
+            if (userReports.isEmpty()) continue;
+
+            userCount++;
+            Sheet sheet = workbook.createSheet("User_" + userCount);
+            createUserSummarySheet(sheet, userReports, userEmail, workbook);
+        }
+
+        try (FileOutputStream out = new FileOutputStream(fullPath)) {
+            workbook.write(out);
+        }
+        workbook.close();
+
+        return new java.io.File(fullPath).getAbsolutePath();
+    }
+
+    /**
+     * 🆕 Tạo Organization Summary Sheet
+     */
+    private void createOrganizationSummarySheet(Workbook wb, java.util.Map<String, java.util.List<FolderDetailedReport>> allUserReports) {
+        Sheet sheet = wb.createSheet("Organization Summary");
+
+        // Title style
+        CellStyle titleStyle = wb.createCellStyle();
+        Font titleFont = wb.createFont();
+        titleFont.setBold(true);
+        titleFont.setFontHeightInPoints((short) 14);
+        titleStyle.setFont(titleFont);
+
+        // Header style
+        CellStyle headerStyle = wb.createCellStyle();
+        Font headerFont = wb.createFont();
+        headerFont.setBold(true);
+        headerFont.setColor(IndexedColors.WHITE.getIndex());
+        headerStyle.setFont(headerFont);
+        headerStyle.setFillForegroundColor(IndexedColors.BLUE.getIndex());
+        headerStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+        headerStyle.setAlignment(HorizontalAlignment.CENTER);
+
+        // Title
+        Row row0 = sheet.createRow(0);
+        Cell titleCell = row0.createCell(0);
+        titleCell.setCellValue("📊 ORGANIZATION-WIDE DETAILED ACTIVITY REPORT");
+        titleCell.setCellStyle(titleStyle);
+
+        sheet.createRow(2).createCell(0).setCellValue("Report Generated:");
+        sheet.getRow(2).createCell(1).setCellValue(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()));
+
+        sheet.createRow(3).createCell(0).setCellValue("Total Users:");
+        sheet.getRow(3).createCell(1).setCellValue(allUserReports.size());
+
+        // Calculate totals
+        int totalFolders = 0;
+        int totalFiles = 0;
+        int totalEvents = 0;
+
+        for (java.util.List<FolderDetailedReport> reports : allUserReports.values()) {
+            totalFolders += reports.size();
+            for (FolderDetailedReport report : reports) {
+                totalFiles += report.detailedLog.fileMap.size();
+                totalEvents += report.detailedLog.activityLog.size();
+            }
+        }
+
+        sheet.createRow(4).createCell(0).setCellValue("Total Folders:");
+        sheet.getRow(4).createCell(1).setCellValue(totalFolders);
+
+        sheet.createRow(5).createCell(0).setCellValue("Total Files:");
+        sheet.getRow(5).createCell(1).setCellValue(totalFiles);
+
+        sheet.createRow(6).createCell(0).setCellValue("Total Events:");
+        sheet.getRow(6).createCell(1).setCellValue(totalEvents);
+
+        // User breakdown header
+        Row headerRow = sheet.createRow(8);
+        String[] headers = {"User Email", "Folders", "Files", "Events"};
+        for (int i = 0; i < headers.length; i++) {
+            Cell cell = headerRow.createCell(i);
+            cell.setCellValue(headers[i]);
+            cell.setCellStyle(headerStyle);
+        }
+
+        // User data
+        int rowNum = 9;
+        for (java.util.Map.Entry<String, java.util.List<FolderDetailedReport>> entry : allUserReports.entrySet()) {
+            String userEmail = entry.getKey();
+            java.util.List<FolderDetailedReport> reports = entry.getValue();
+
+            int userFolders = reports.size();
+            int userFiles = 0;
+            int userEvents = 0;
+
+            for (FolderDetailedReport report : reports) {
+                userFiles += report.detailedLog.fileMap.size();
+                userEvents += report.detailedLog.activityLog.size();
+            }
+
+            Row row = sheet.createRow(rowNum++);
+            row.createCell(0).setCellValue(userEmail);
+            row.createCell(1).setCellValue(userFolders);
+            row.createCell(2).setCellValue(userFiles);
+            row.createCell(3).setCellValue(userEvents);
+        }
+
+        sheet.autoSizeColumn(0);
+        sheet.autoSizeColumn(1);
+        sheet.autoSizeColumn(2);
+        sheet.autoSizeColumn(3);
+        sheet.setColumnWidth(0, 8000);
+    }
+
+    /**
+     * 🆕 Tạo User Summary Sheet
+     */
+    private void createUserSummarySheet(Sheet sheet, java.util.List<FolderDetailedReport> reports, String userEmail, Workbook wb) {
+        // Title style
+        CellStyle titleStyle = wb.createCellStyle();
+        Font titleFont = wb.createFont();
+        titleFont.setBold(true);
+        titleFont.setFontHeightInPoints((short) 12);
+        titleStyle.setFont(titleFont);
+
+        // Header style
+        CellStyle headerStyle = wb.createCellStyle();
+        Font headerFont = wb.createFont();
+        headerFont.setBold(true);
+        headerFont.setColor(IndexedColors.WHITE.getIndex());
+        headerStyle.setFont(headerFont);
+        headerStyle.setFillForegroundColor(IndexedColors.BLUE.getIndex());
+        headerStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+        headerStyle.setAlignment(HorizontalAlignment.CENTER);
+
+        // Title
+        Row row0 = sheet.createRow(0);
+        Cell titleCell = row0.createCell(0);
+        titleCell.setCellValue("USER: " + userEmail);
+        titleCell.setCellStyle(titleStyle);
+
+        sheet.createRow(2).createCell(0).setCellValue("Total Folders:");
+        sheet.getRow(2).createCell(1).setCellValue(reports.size());
+
+        int totalFiles = 0;
+        int totalEvents = 0;
+        for (FolderDetailedReport report : reports) {
+            totalFiles += report.detailedLog.fileMap.size();
+            totalEvents += report.detailedLog.activityLog.size();
+        }
+
+        sheet.createRow(3).createCell(0).setCellValue("Total Files:");
+        sheet.getRow(3).createCell(1).setCellValue(totalFiles);
+
+        sheet.createRow(4).createCell(0).setCellValue("Total Events:");
+        sheet.getRow(4).createCell(1).setCellValue(totalEvents);
+
+        // Folder breakdown
+        Row headerRow = sheet.createRow(6);
+        String[] headers = {"Folder Path", "Folder ID", "Files", "Events"};
+        for (int i = 0; i < headers.length; i++) {
+            Cell cell = headerRow.createCell(i);
+            cell.setCellValue(headers[i]);
+            cell.setCellStyle(headerStyle);
+        }
+
+        int rowNum = 7;
+        for (FolderDetailedReport report : reports) {
+            Row row = sheet.createRow(rowNum++);
+            row.createCell(0).setCellValue(report.folderInfo.path);
+            row.createCell(1).setCellValue(report.folderInfo.id);
+            row.createCell(2).setCellValue(report.detailedLog.fileMap.size());
+            row.createCell(3).setCellValue(report.detailedLog.activityLog.size());
+        }
+
+        sheet.autoSizeColumn(0);
+        sheet.autoSizeColumn(1);
+        sheet.autoSizeColumn(2);
+        sheet.autoSizeColumn(3);
+        sheet.setColumnWidth(0, 8000);
+        sheet.setColumnWidth(1, 8000);
+    }
+
+    /**
+     * 🆕 Tạo Consolidated Summary Sheet
+     */
+    private void createConsolidatedSummarySheet(Workbook wb, java.util.List<FolderDetailedReport> reports, String userEmail) {
+        Sheet sheet = wb.createSheet("Summary");
+
+        // Title style
+        CellStyle titleStyle = wb.createCellStyle();
+        Font titleFont = wb.createFont();
+        titleFont.setBold(true);
+        titleFont.setFontHeightInPoints((short) 14);
+        titleStyle.setFont(titleFont);
+
+        // Header style
+        CellStyle headerStyle = wb.createCellStyle();
+        Font headerFont = wb.createFont();
+        headerFont.setBold(true);
+        headerFont.setColor(IndexedColors.WHITE.getIndex());
+        headerStyle.setFont(headerFont);
+        headerStyle.setFillForegroundColor(IndexedColors.BLUE.getIndex());
+        headerStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+        headerStyle.setAlignment(HorizontalAlignment.CENTER);
+
+        // Title
+        Row row0 = sheet.createRow(0);
+        Cell titleCell = row0.createCell(0);
+        titleCell.setCellValue("📊 ALL FOLDERS ACTIVITY REPORT - " + userEmail);
+        titleCell.setCellStyle(titleStyle);
+
+        sheet.createRow(2).createCell(0).setCellValue("User Email:");
+        sheet.getRow(2).createCell(1).setCellValue(userEmail);
+
+        sheet.createRow(3).createCell(0).setCellValue("Total Folders:");
+        sheet.getRow(3).createCell(1).setCellValue(reports.size());
+
+        int totalFiles = 0;
+        int totalEvents = 0;
+        for (FolderDetailedReport report : reports) {
+            totalFiles += report.detailedLog.fileMap.size();
+            totalEvents += report.detailedLog.activityLog.size();
+        }
+
+        sheet.createRow(4).createCell(0).setCellValue("Total Files:");
+        sheet.getRow(4).createCell(1).setCellValue(totalFiles);
+
+        sheet.createRow(5).createCell(0).setCellValue("Total Events:");
+        sheet.getRow(5).createCell(1).setCellValue(totalEvents);
+
+        sheet.createRow(6).createCell(0).setCellValue("Report Generated:");
+        sheet.getRow(6).createCell(1).setCellValue(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()));
+
+        // Folder details
+        Row headerRow = sheet.createRow(8);
+        String[] headers = {"Folder Path", "Folder ID", "Files", "Events"};
+        for (int i = 0; i < headers.length; i++) {
+            Cell cell = headerRow.createCell(i);
+            cell.setCellValue(headers[i]);
+            cell.setCellStyle(headerStyle);
+        }
+
+        int rowNum = 9;
+        for (FolderDetailedReport report : reports) {
+            Row row = sheet.createRow(rowNum++);
+            row.createCell(0).setCellValue(report.folderInfo.path);
+            row.createCell(1).setCellValue(report.folderInfo.id);
+            row.createCell(2).setCellValue(report.detailedLog.fileMap.size());
+            row.createCell(3).setCellValue(report.detailedLog.activityLog.size());
+        }
+
+        sheet.autoSizeColumn(0);
+        sheet.autoSizeColumn(1);
+        sheet.autoSizeColumn(2);
+        sheet.autoSizeColumn(3);
+        sheet.setColumnWidth(0, 10000);
+        sheet.setColumnWidth(1, 8000);
+    }
+
+    /**
+     * 🆕 Tạo Folder Detail Sheet (simplified)
+     */
+    private void createFolderDetailSheetSimple(Sheet sheet, FolderDetailedReport report, Workbook wb) {
+        CellStyle headerStyle = wb.createCellStyle();
+        Font headerFont = wb.createFont();
+        headerFont.setBold(true);
+        headerFont.setColor(IndexedColors.WHITE.getIndex());
+        headerStyle.setFont(headerFont);
+        headerStyle.setFillForegroundColor(IndexedColors.BLUE.getIndex());
+        headerStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+        headerStyle.setAlignment(HorizontalAlignment.CENTER);
+
+        // Title
+        Row row0 = sheet.createRow(0);
+        row0.createCell(0).setCellValue("Folder: " + report.folderInfo.path);
+
+        Row row1 = sheet.createRow(1);
+        row1.createCell(0).setCellValue("Folder ID: " + report.folderInfo.id);
+
+        // Activity timeline
+        Row headerRow = sheet.createRow(3);
+        String[] headers = {"Timestamp", "File/Folder", "Action", "Actor", "Details"};
+        for (int i = 0; i < headers.length; i++) {
+            Cell cell = headerRow.createCell(i);
+            cell.setCellValue(headers[i]);
+            cell.setCellStyle(headerStyle);
+        }
+
+        SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+        int rowNum = 4;
+
+        for (ActivityEvent event : report.detailedLog.activityLog) {
+            if (rowNum > 1000) break; // Limit rows
+
+            Row row = sheet.createRow(rowNum++);
+            row.createCell(0).setCellValue(sdf.format(event.timestamp));
+            row.createCell(1).setCellValue(event.fileName);
+            row.createCell(2).setCellValue(event.action);
+            row.createCell(3).setCellValue(event.actor);
+            row.createCell(4).setCellValue(event.details);
+        }
+
+        sheet.autoSizeColumn(0);
+        sheet.autoSizeColumn(1);
+        sheet.autoSizeColumn(2);
+        sheet.autoSizeColumn(3);
+        sheet.autoSizeColumn(4);
+        sheet.setColumnWidth(1, 8000);
+        sheet.setColumnWidth(4, 10000);
+    }
+
+    /**
+     * 🆕 Inner class cho detailed report
+     */
+    static class FolderDetailedReport {
+        FolderInfo folderInfo;
+        DetailedLog detailedLog;
+    }
+
     // ============================================
     // INNER CLASSES
     // ============================================

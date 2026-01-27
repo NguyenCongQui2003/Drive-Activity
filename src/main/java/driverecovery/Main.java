@@ -22,6 +22,8 @@ public class Main {
     // ============================================
     private static final String MODE_NORMAL = "1";
     private static final String MODE_DETAILED_ACTIVITY = "2";
+    private static final String MODE_DETAILED_USER = "3";      // 🆕 THÊM DÒNG NÀY
+    private static final String MODE_DETAILED_ALL_USERS = "4"; // 🆕 THÊM DÒNG NÀY
 
 
     public static void main(String[] args) {
@@ -35,13 +37,19 @@ public class Main {
         System.out.println("📋 CHỌN CHE ĐỘ CHẠY:");
         System.out.println("  1. Normal Mode - Recovery files cho tất cả users");
         System.out.println("  2. Detailed Activity Log - Phân tích chi tiết 1 folder");
-        System.out.print("\nNhập lựa chọn (1 hoặc 2): ");
+        System.out.println("  3. Detailed Activity Log - Phân tích 1 user (tất cả folders)");  // 🆕 THÊM
+        System.out.println("  4. Detailed Activity Log - Phân tích toàn bộ users");           // 🆕 THÊM
+        System.out.print("\nNhập lựa chọn (1/2/3/4): ");  // 🆕 SỬA
 
         Scanner scanner = new Scanner(System.in);
         String mode = scanner.nextLine().trim();
 
         if (MODE_DETAILED_ACTIVITY.equals(mode)) {
             runDetailedActivityMode(scanner);
+        } else if (MODE_DETAILED_USER.equals(mode)) {        // 🆕 THÊM
+            runDetailedActivityUserMode(scanner);             // 🆕 THÊM
+        } else if (MODE_DETAILED_ALL_USERS.equals(mode)) {   // 🆕 THÊM
+            runDetailedActivityAllUsersMode(scanner);         // 🆕 THÊM
         } else {
             runNormalMode();
         }
@@ -162,6 +170,132 @@ public class Main {
             e.printStackTrace();
             System.exit(1);
         }
+    }
+
+    /**
+     * 🆕 MODE 3: Detailed Activity cho TẤT CẢ FOLDERS của 1 USER
+     */
+    private static void runDetailedActivityUserMode(Scanner scanner) {
+        System.out.println("\n🔍 Đang chạy DETAILED ACTIVITY LOG MODE (1 USER - TẤT CẢ FOLDERS)...\n");
+
+        System.out.print("👤 Nhập email user cần phân tích (Enter = dùng user đầu tiên): ");
+        String userEmail = scanner.nextLine().trim();
+
+        if (userEmail.isEmpty()) {
+            userEmail = Config.USERS_TO_CHECK.get(0);
+            System.out.println("→ Sử dụng user mặc định: " + userEmail);
+        }
+
+        try {
+            System.out.println("\n🔧 Đang khởi tạo services...");
+            Drive driveService = createDriveServiceForUser(userEmail);
+            DriveActivity activityService = createActivityServiceForUser(userEmail);
+            System.out.println("✅ Services đã sẵn sàng\n");
+
+            DetailedActivityService detailedService = new DetailedActivityService(
+                    driveService,
+                    activityService
+            );
+
+            System.out.println("========================================");
+            System.out.println("   BẮT ĐẦU PHÂN TÍCH TẤT CẢ FOLDERS");
+            System.out.println("========================================\n");
+
+            String reportPath = detailedService.analyzeAllFoldersForUser(userEmail);
+
+            System.out.println("\n========================================");
+            System.out.println("   ✅ HOÀN THÀNH");
+            System.out.println("========================================");
+            System.out.println("📁 Báo cáo chi tiết: " + reportPath);
+            System.out.println("\nFile Excel chứa:");
+            System.out.println("  - Summary: Tổng hợp tất cả folders");
+            System.out.println("  - Chi tiết từng folder (tối đa 10 folders)");
+
+        } catch (Exception e) {
+            System.err.println("\n❌ LỖI: " + e.getMessage());
+            e.printStackTrace();
+            System.exit(1);
+        }
+    }
+
+    /**
+     * 🆕 MODE 4: Detailed Activity cho TẤT CẢ USERS trong tổ chức
+     */
+    private static void runDetailedActivityAllUsersMode(Scanner scanner) {
+        System.out.println("\n🔍 Đang chạy DETAILED ACTIVITY LOG MODE (TOÀN BỘ USERS)...\n");
+
+        System.out.println("⚠️  CHẾ ĐỘ NÀY SẼ MẤT NHIỀU THỜI GIAN!");
+        System.out.println("📋 Sẽ phân tích " + Config.USERS_TO_CHECK.size() + " users");
+        System.out.print("Bạn có chắc chắn muốn tiếp tục? (y/n): ");
+        String confirm = scanner.nextLine().trim().toLowerCase();
+
+        if (!confirm.equals("y")) {
+            System.out.println("❌ Đã hủy.");
+            System.exit(0);
+        }
+
+        try {
+            System.out.println("\n🔧 Đang khởi tạo services...");
+            Drive driveService = createDriveService();
+            DriveActivity activityService = createActivityService();
+            System.out.println("✅ Services đã sẵn sàng\n");
+
+            DetailedActivityService detailedService = new DetailedActivityService(
+                    driveService,
+                    activityService
+            );
+
+            System.out.println("========================================");
+            System.out.println("   BẮT ĐẦU PHÂN TÍCH TOÀN TỔ CHỨC");
+            System.out.println("========================================\n");
+
+            String reportPath = detailedService.analyzeAllFoldersForAllUsers(Config.USERS_TO_CHECK);
+
+            System.out.println("\n========================================");
+            System.out.println("   ✅ HOÀN THÀNH");
+            System.out.println("========================================");
+            System.out.println("📁 Báo cáo tổng hợp: " + reportPath);
+            System.out.println("\nFile Excel chứa:");
+            System.out.println("  - Organization Summary: Tổng quan toàn tổ chức");
+            System.out.println("  - Chi tiết từng user (tối đa 20 users)");
+
+        } catch (Exception e) {
+            System.err.println("\n❌ LỖI: " + e.getMessage());
+            e.printStackTrace();
+            System.exit(1);
+        }
+    }
+
+    /**
+     * 🆕 Helper: Create Drive service for specific user
+     */
+    private static Drive createDriveServiceForUser(String userEmail) throws IOException, GeneralSecurityException {
+        GoogleCredentials credentials = createCredentials()
+                .createDelegated(userEmail);
+
+        return new Drive.Builder(
+                GoogleNetHttpTransport.newTrustedTransport(),
+                GsonFactory.getDefaultInstance(),
+                new HttpCredentialsAdapter(credentials)
+        )
+                .setApplicationName("Drive Recovery Tool v2.0")
+                .build();
+    }
+
+    /**
+     * 🆕 Helper: Create Activity service for specific user
+     */
+    private static DriveActivity createActivityServiceForUser(String userEmail) throws IOException, GeneralSecurityException {
+        GoogleCredentials credentials = createCredentials()
+                .createDelegated(userEmail);
+
+        return new DriveActivity.Builder(
+                GoogleNetHttpTransport.newTrustedTransport(),
+                GsonFactory.getDefaultInstance(),
+                new HttpCredentialsAdapter(credentials)
+        )
+                .setApplicationName("Drive Recovery Tool v2.0")
+                .build();
     }
 
     // ============================================
