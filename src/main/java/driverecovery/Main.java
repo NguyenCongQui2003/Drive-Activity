@@ -64,44 +64,74 @@ public class Main {
         System.out.println("\n🔧 Đang chạy NORMAL MODE...\n");
 
         try {
-            System.out.println("🔧 Đang khởi tạo services...");
-            Drive driveService = createDriveService();
-            DriveActivity activityService = createActivityService();
-            System.out.println("✅ Services đã sẵn sàng\n");
-
-            DriveRecoveryService recoveryService = new DriveRecoveryService(
-                    driveService,
-                    activityService
-            );
-
             System.out.println("👥 Danh sách users cần kiểm tra: " + Config.USERS_TO_CHECK.size());
+
+            // ✅ LOOP QUA TỪNG USER - MỖI USER TẠO 1 FILE EXCEL RIÊNG
             for (int i = 0; i < Config.USERS_TO_CHECK.size(); i++) {
                 String userEmail = Config.USERS_TO_CHECK.get(i);
+
                 System.out.println("\n╔════════════════════════════════════════════════════════════");
                 System.out.println("║ USER " + (i + 1) + "/" + Config.USERS_TO_CHECK.size() + ": " + userEmail);
                 System.out.println("╚════════════════════════════════════════════════════════════");
 
                 try {
+                    // 🆕 TẠO SERVICE MỚI CHO TỪNG USER
+                    System.out.println("🔧 Đang khởi tạo services cho user: " + userEmail);
+                    Drive driveService = createDriveService();
+                    DriveActivity activityService = createActivityService();
+                    System.out.println("✅ Services đã sẵn sàng\n");
+
+                    // 🆕 Hiển thị cấu hình filter
+                    System.out.println("⚙️  CẤU HÌNH ACTIVITY FILTER:");
+                    if (Config.ACTIVITY_DAYS > 0) {
+                        System.out.println("   - Đọc activity từ " + Config.ACTIVITY_DAYS + " ngày trước");
+                    } else {
+                        System.out.println("   - Đọc activity từ quá khứ (không giới hạn)");
+                    }
+
+                    if (Config.ACTIVITY_END_DATE != null && !Config.ACTIVITY_END_DATE.isEmpty()) {
+                        System.out.println("   - ✂️  CẮT TẠI: " + Config.ACTIVITY_END_DATE + " (không đọc activity sau ngày này)");
+                    } else {
+                        System.out.println("   - Đọc đến hiện tại (không giới hạn ngày kết thúc)");
+                    }
+                    System.out.println("");
+
+                    // 🆕 TẠO RECOVERY SERVICE MỚI CHO TỪNG USER
+                    DriveRecoveryService recoveryService = new DriveRecoveryService(
+                            driveService,
+                            activityService
+                    );
+
+                    // 🆕 XỬ LÝ DRIVE CỦA USER NÀY
                     recoveryService.processUserDrive(userEmail);
+
+                    // 🆕 TẠO FILE EXCEL RIÊNG CHO USER NÀY NGAY SAU KHI XỬ LÝ XONG
+                    System.out.println("\n╔════════════════════════════════════════════════════════════");
+                    System.out.println("║ TẠO BÁO CÁO EXCEL CHO: " + userEmail);
+                    System.out.println("╚════════════════════════════════════════════════════════════");
+                    System.out.println("📊 Đang tổng hợp dữ liệu...");
+
+                    String reportPath = recoveryService.generateExcelReport();
+
+                    System.out.println("✅ Báo cáo đã được tạo thành công cho " + userEmail + "!");
+                    System.out.println("📁 Đường dẫn: " + reportPath);
+                    System.out.println("");
+
                 } catch (Exception e) {
-                    System.err.println("\n❌ LỖI khi kiểm tra " + userEmail);
+                    System.err.println("\n❌ LỖI khi xử lý user: " + userEmail);
                     System.err.println("Chi tiết: " + e.getMessage());
                     e.printStackTrace();
+                    System.err.println("⏭️  Tiếp tục với user tiếp theo...\n");
                 }
             }
 
-            System.out.println("\n╔════════════════════════════════════════════════════════════");
-            System.out.println("║ TẠO BÁO CÁO EXCEL");
-            System.out.println("╚════════════════════════════════════════════════════════════");
-            System.out.println("📊 Đang tổng hợp dữ liệu...");
-            String reportPath = recoveryService.generateExcelReport();
-            System.out.println("✅ Báo cáo đã được tạo thành công!");
-            System.out.println("📁 Đường dẫn: " + reportPath);
-
+            // ✅ KẾT THÚC - ĐÃ TẠO XONG TẤT CẢ FILE EXCEL
             System.out.println("\n========================================");
-            System.out.println("   ✅ HOÀN THÀNH");
+            System.out.println("   ✅ HOÀN THÀNH TẤT CẢ USERS");
             System.out.println("========================================");
-            System.out.println("Hãy mở file Excel để xem chi tiết báo cáo.");
+            System.out.println("📊 Đã tạo " + Config.USERS_TO_CHECK.size() + " file Excel riêng biệt.");
+            System.out.println("📁 Tất cả file đều nằm trong thư mục Export");
+            System.out.println("\nHãy mở từng file Excel để xem chi tiết báo cáo của từng user.");
 
         } catch (Exception e) {
             System.err.println("\n╔════════════════════════════════════════════════════════════");
@@ -138,6 +168,22 @@ public class Main {
             Drive driveService = createDriveService();
             DriveActivity activityService = createActivityService();
             System.out.println("✅ Services đã sẵn sàng\n");
+
+// 🆕 THÊM ĐOẠN NÀY - Hiển thị cấu hình filter
+            System.out.println("⚙️  CẤU HÌNH ACTIVITY FILTER:");
+            if (Config.ACTIVITY_DAYS > 0) {
+                System.out.println("   - Đọc activity từ " + Config.ACTIVITY_DAYS + " ngày trước");
+            } else {
+                System.out.println("   - Đọc activity từ quá khứ (không giới hạn)");
+            }
+
+            if (Config.ACTIVITY_END_DATE != null && !Config.ACTIVITY_END_DATE.isEmpty()) {
+                System.out.println("   - ✂️  CẮT TẠI: " + Config.ACTIVITY_END_DATE + " (không đọc activity sau ngày này)");
+            } else {
+                System.out.println("   - Đọc đến hiện tại (không giới hạn ngày kết thúc)");
+            }
+            System.out.println("");
+// 🆕 KẾT THÚC ĐOẠN THÊM
 
             DetailedActivityService detailedService = new DetailedActivityService(
                     driveService,
@@ -192,6 +238,22 @@ public class Main {
             DriveActivity activityService = createActivityServiceForUser(userEmail);
             System.out.println("✅ Services đã sẵn sàng\n");
 
+// 🆕 THÊM ĐOẠN NÀY - Hiển thị cấu hình filter
+            System.out.println("⚙️  CẤU HÌNH ACTIVITY FILTER:");
+            if (Config.ACTIVITY_DAYS > 0) {
+                System.out.println("   - Đọc activity từ " + Config.ACTIVITY_DAYS + " ngày trước");
+            } else {
+                System.out.println("   - Đọc activity từ quá khứ (không giới hạn)");
+            }
+
+            if (Config.ACTIVITY_END_DATE != null && !Config.ACTIVITY_END_DATE.isEmpty()) {
+                System.out.println("   - ✂️  CẮT TẠI: " + Config.ACTIVITY_END_DATE + " (không đọc activity sau ngày này)");
+            } else {
+                System.out.println("   - Đọc đến hiện tại (không giới hạn ngày kết thúc)");
+            }
+            System.out.println("");
+// 🆕 KẾT THÚC ĐOẠN THÊM
+
             DetailedActivityService detailedService = new DetailedActivityService(
                     driveService,
                     activityService
@@ -239,6 +301,22 @@ public class Main {
             Drive driveService = createDriveService();
             DriveActivity activityService = createActivityService();
             System.out.println("✅ Services đã sẵn sàng\n");
+
+// 🆕 THÊM ĐOẠN NÀY - Hiển thị cấu hình filter
+            System.out.println("⚙️  CẤU HÌNH ACTIVITY FILTER:");
+            if (Config.ACTIVITY_DAYS > 0) {
+                System.out.println("   - Đọc activity từ " + Config.ACTIVITY_DAYS + " ngày trước");
+            } else {
+                System.out.println("   - Đọc activity từ quá khứ (không giới hạn)");
+            }
+
+            if (Config.ACTIVITY_END_DATE != null && !Config.ACTIVITY_END_DATE.isEmpty()) {
+                System.out.println("   - ✂️  CẮT TẠI: " + Config.ACTIVITY_END_DATE + " (không đọc activity sau ngày này)");
+            } else {
+                System.out.println("   - Đọc đến hiện tại (không giới hạn ngày kết thúc)");
+            }
+            System.out.println("");
+// 🆕 KẾT THÚC ĐOẠN THÊM
 
             DetailedActivityService detailedService = new DetailedActivityService(
                     driveService,

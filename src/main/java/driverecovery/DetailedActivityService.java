@@ -12,6 +12,8 @@ import java.io.IOException;
 import java.text.SimpleDateFormat;
 import java.util.*;
 import java.util.Date;
+import java.util.Calendar;
+import java.util.TimeZone;
 
 /**
  * ⭐ DETAILED ACTIVITY SERVICE - ENHANCED EXCEL EXPORT
@@ -95,6 +97,13 @@ public class DetailedActivityService {
             QueryDriveActivityRequest request = new QueryDriveActivityRequest();
             request.setAncestorName("items/" + folderId);
             request.setPageSize(100);
+
+            // 🆕 THÊM FILTER
+            String filter = buildActivityFilter();
+            if (filter != null && !filter.isEmpty()) {
+                request.setFilter(filter);
+            }
+
             if (pageToken != null) {
                 request.setPageToken(pageToken);
             }
@@ -111,6 +120,59 @@ public class DetailedActivityService {
         } while (pageToken != null);
 
         return activities;
+    }
+
+    /**
+     * 🆕 Build filter string cho Activity API
+     */
+    private String buildActivityFilter() {
+        List<String> filterParts = new ArrayList<>();
+
+        // 1. Filter START time
+        if (Config.ACTIVITY_DAYS > 0) {
+            try {
+                Calendar cal = Calendar.getInstance();
+                cal.add(Calendar.DATE, -Config.ACTIVITY_DAYS);
+
+                SimpleDateFormat isoFormat = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'");
+                isoFormat.setTimeZone(TimeZone.getTimeZone("UTC"));
+
+                String startTime = isoFormat.format(cal.getTime());
+                filterParts.add("time >= \"" + startTime + "\"");
+            } catch (Exception e) {
+                System.err.println("⚠️  Lỗi parse ACTIVITY_DAYS: " + e.getMessage());
+            }
+        }
+
+        // 2. ✨ Filter END time
+        if (Config.ACTIVITY_END_DATE != null && !Config.ACTIVITY_END_DATE.isEmpty()) {
+            try {
+                SimpleDateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd");
+                dateFormat.setTimeZone(TimeZone.getTimeZone("UTC"));
+                Date endDate = dateFormat.parse(Config.ACTIVITY_END_DATE);
+
+                Calendar cal = Calendar.getInstance(TimeZone.getTimeZone("UTC"));
+                cal.setTime(endDate);
+                cal.set(Calendar.HOUR_OF_DAY, 23);
+                cal.set(Calendar.MINUTE, 59);
+                cal.set(Calendar.SECOND, 59);
+                cal.set(Calendar.MILLISECOND, 999);
+
+                SimpleDateFormat isoFormat = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'");
+                isoFormat.setTimeZone(TimeZone.getTimeZone("UTC"));
+
+                String endTime = isoFormat.format(cal.getTime());
+                filterParts.add("time <= \"" + endTime + "\"");
+            } catch (Exception e) {
+                System.err.println("⚠️  Lỗi parse ACTIVITY_END_DATE: " + e.getMessage());
+            }
+        }
+
+        if (filterParts.isEmpty()) {
+            return null;
+        }
+
+        return String.join(" AND ", filterParts);
     }
 
     private DetailedLog analyzeDetailedActivity(

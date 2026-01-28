@@ -15,6 +15,9 @@ import java.util.*;
 import java.util.Date;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
+import java.util.Calendar;
+import java.util.TimeZone;
+import java.text.ParseException;
 
 public class DriveRecoveryService {
 
@@ -660,10 +663,27 @@ public class DriveRecoveryService {
 
         System.out.println("  🔍 Đang query Activity API...");
 
+        // ✨ LOG: Hiển thị cấu hình filter
+        if (Config.ACTIVITY_DAYS > 0) {
+            System.out.println("  ⏰ Filter: Đọc activity từ " + Config.ACTIVITY_DAYS + " ngày trước");
+        }
+
+        if (Config.ACTIVITY_END_DATE != null && !Config.ACTIVITY_END_DATE.isEmpty()) {
+            System.out.println("  ✂️  Filter: Cắt đọc tại " + Config.ACTIVITY_END_DATE);
+        }
+
         do {
             QueryDriveActivityRequest request = new QueryDriveActivityRequest();
             request.setAncestorName("items/" + folderId);
             request.setPageSize(100);
+
+            // 🆕 THÊM FILTER
+            String filter = buildActivityFilter();
+            if (filter != null && !filter.isEmpty()) {
+                request.setFilter(filter);
+                System.out.println("  🔍 Filter string: " + filter);
+            }
+
             if (pageToken != null) {
                 request.setPageToken(pageToken);
             }
@@ -682,6 +702,11 @@ public class DriveRecoveryService {
                     return timeA.compareTo(timeB);
                 });
 
+                // ✨ LOG: Hiển thị khoảng thời gian
+                if (!activities.isEmpty() && pageToken == null) { // Chỉ log lần đầu
+                    logActivityTimeRange(activities, folderId);
+                }
+
                 System.out.println("  🔍 Xử lý " + activities.size() + " activities...");
 
                 for (com.google.api.services.driveactivity.v2.model.DriveActivity activity : activities) {
@@ -699,6 +724,144 @@ public class DriveRecoveryService {
         System.out.println("  🔍 Có " + result.size() + " file từng thuộc TRỰC TIẾP folder này");
 
         return result;
+    }
+
+    /**
+     * 🆕 Build filter string cho Activity API
+     */
+    private String buildActivityFilter() {
+        List<String> filterParts = new ArrayList<>();
+
+        // 1. Filter START time (nếu có ACTIVITY_DAYS)
+        if (Config.ACTIVITY_DAYS > 0) {
+            try {
+                Calendar cal = Calendar.getInstance();
+                cal.add(Calendar.DATE, -Config.ACTIVITY_DAYS);
+
+                SimpleDateFormat isoFormat = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'");
+                isoFormat.setTimeZone(TimeZone.getTimeZone("UTC"));
+
+                String startTime = isoFormat.format(cal.getTime());
+                filterParts.add("time >= \"" + startTime + "\"");
+            } catch (Exception e) {
+                System.err.println("⚠️  Lỗi parse ACTIVITY_DAYS: " + e.getMessage());
+            }
+        }
+
+        // 2. ✨ Filter END time (nếu có ACTIVITY_END_DATE)
+        if (Config.ACTIVITY_END_DATE != null && !Config.ACTIVITY_END_DATE.isEmpty()) {
+            try {
+                // Parse ngày người dùng nhập (format: yyyy-MM-dd)
+                SimpleDateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd");
+                dateFormat.setTimeZone(TimeZone.getTimeZone("UTC"));
+                Date endDate = dateFormat.parse(Config.ACTIVITY_END_DATE);
+
+                // Set time đến cuối ngày (23:59:59.999)
+                Calendar cal = Calendar.getInstance(TimeZone.getTimeZone("UTC"));
+                cal.setTime(endDate);
+                cal.set(Calendar.HOUR_OF_DAY, 23);
+                cal.set(Calendar.MINUTE, 59);
+                cal.set(Calendar.SECOND, 59);
+                cal.set(Calendar.MILLISECOND, 999);
+
+                SimpleDateFormat isoFormat = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'");
+                isoFormat.setTimeZone(TimeZone.getTimeZone("UTC"));
+
+                String endTime = isoFormat.format(cal.getTime());
+                filterParts.add("time <= \"" + endTime + "\"");
+
+                System.out.println("  ✂️  Chỉ đọc activity đến: " + endTime);
+            } catch (Exception e) {
+                System.err.println("⚠️  Lỗi parse ACTIVITY_END_DATE: " + e.getMessage());
+            }
+        }
+
+        // Ghép filter
+        if (filterParts.isEmpty()) {
+            return null;
+        }
+
+        return String.join(" AND ", filterParts);
+    }
+
+    /**
+     * 🆕 Log khoảng thời gian activity
+     */
+    private void logActivityTimeRange(List<com.google.api.services.driveactivity.v2.model.DriveActivity> activities,
+                                      String folderId) {
+        if (activities.isEmpty()) return;
+
+        try {
+            SimpleDateFormat displayFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+            displayFormat.setTimeZone(TimeZone.getTimeZone("GMT+7"));
+
+            // Activity cũ nhất
+            com.google.api.services.driveactivity.v2.model.DriveActivity earliest = activities.get(0);
+            String earliestTime = "N/A";
+            if (earliest.getTimestamp() != null) {
+                Date date = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'")
+                        .parse(earliest.getTimestamp());
+                earliestTime = displayFormat.format(date);
+            }
+
+            // Activity mới nhất (đã filter)
+            com.google.api.services.driveactivity.v2.model.DriveActivity latest = activities.get(activities.size() - 1);
+            String latestTimeFiltered = "N/A";
+            if (latest.getTimestamp() != null) {
+                Date date = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'")
+                        .parse(latest.getTimestamp());
+                latestTimeFiltered = displayFormat.format(date);
+            }
+
+            System.out.println("  📅 Khoảng thời gian activity:");
+            System.out.println("     📍 Activity cũ nhất: " + earliestTime);
+
+            // Nếu có filter END_DATE, lấy activity mới nhất THỰC SỰ (không filter)
+            if (Config.ACTIVITY_END_DATE != null && !Config.ACTIVITY_END_DATE.isEmpty()) {
+                try {
+                    // Query lại KHÔNG có filter để biết activity mới nhất thực tế
+                    QueryDriveActivityRequest unfilteredRequest = new QueryDriveActivityRequest();
+                    unfilteredRequest.setAncestorName("items/" + folderId);
+                    unfilteredRequest.setPageSize(100);
+
+                    QueryDriveActivityResponse unfilteredResponse = activityService.activity()
+                            .query(unfilteredRequest)
+                            .execute();
+
+                    if (unfilteredResponse.getActivities() != null &&
+                            !unfilteredResponse.getActivities().isEmpty()) {
+
+                        List<com.google.api.services.driveactivity.v2.model.DriveActivity> unfilteredActivities =
+                                new ArrayList<>(unfilteredResponse.getActivities());
+
+                        unfilteredActivities.sort((a, b) -> {
+                            String timeA = a.getTimestamp() != null ? a.getTimestamp() : "";
+                            String timeB = b.getTimestamp() != null ? b.getTimestamp() : "";
+                            return timeA.compareTo(timeB);
+                        });
+
+                        com.google.api.services.driveactivity.v2.model.DriveActivity latestReal =
+                                unfilteredActivities.get(unfilteredActivities.size() - 1);
+
+                        if (latestReal.getTimestamp() != null) {
+                            Date date = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'")
+                                    .parse(latestReal.getTimestamp());
+                            String latestTimeReal = displayFormat.format(date);
+                            System.out.println("     📍 Activity mới nhất (thực tế trong Drive): " + latestTimeReal);
+                        }
+                    }
+                } catch (Exception e) {
+                    // Ignore error khi query unfiltered
+                }
+
+                System.out.println("     ✂️  Cắt đọc tại: " + Config.ACTIVITY_END_DATE + " 23:59:59 (chỉ lấy activity đến đây)");
+            } else {
+                System.out.println("     📍 Activity mới nhất: " + latestTimeFiltered);
+            }
+
+        } catch (Exception e) {
+            System.err.println("⚠️  Lỗi khi log time range: " + e.getMessage());
+        }
     }
 
     private void processActivity(com.google.api.services.driveactivity.v2.model.DriveActivity activity,
@@ -942,7 +1105,7 @@ public class DriveRecoveryService {
     /**
      * ⭐ ENHANCED: Tạo Excel report với 5 sheets
      */
-    public String generateExcelReport() throws IOException {
+    public String generateExcelReport(String currentUserEmail) throws IOException {
         String userEmails = Config.USERS_TO_CHECK.stream()
                 .map(email -> email.split("@")[0])
                 .collect(Collectors.joining("_"));
