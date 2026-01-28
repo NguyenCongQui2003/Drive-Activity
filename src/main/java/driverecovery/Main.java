@@ -111,7 +111,7 @@ public class Main {
                     System.out.println("╚════════════════════════════════════════════════════════════");
                     System.out.println("📊 Đang tổng hợp dữ liệu...");
 
-                    String reportPath = recoveryService.generateExcelReport();
+                    String reportPath = recoveryService.generateExcelReport(userEmail);
 
                     System.out.println("✅ Báo cáo đã được tạo thành công cho " + userEmail + "!");
                     System.out.println("📁 Đường dẫn: " + reportPath);

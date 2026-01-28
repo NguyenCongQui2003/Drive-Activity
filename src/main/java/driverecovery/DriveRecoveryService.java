@@ -1106,9 +1106,7 @@ public class DriveRecoveryService {
      * ⭐ ENHANCED: Tạo Excel report với 5 sheets
      */
     public String generateExcelReport(String currentUserEmail) throws IOException {
-        String userEmails = Config.USERS_TO_CHECK.stream()
-                .map(email -> email.split("@")[0])
-                .collect(Collectors.joining("_"));
+        String userEmails = currentUserEmail.split("@")[0];
 
         String timestamp = new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date());
         String fileName = Config.OUTPUT_FILE_PREFIX + "-" + userEmails + "-" + timestamp + ".xlsx";
