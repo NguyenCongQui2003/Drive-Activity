@@ -1307,19 +1307,38 @@ public class DetailedActivityService {
         String fullPath = Config.OUTPUT_DIRECTORY + fileName;
         Workbook workbook = new XSSFWorkbook();
 
-        // Summary sheet
+        // ⭐ SHEET 1: Organization Summary (tổng quan folders)
         createConsolidatedSummarySheet(workbook, reports, userEmail);
 
-        // Chi tiết từng folder (tối đa 10)
-        int sheetCount = 0;
-        for (int i = 0; i < reports.size() && sheetCount < 10; i++) {
-            FolderDetailedReport report = reports.get(i);
+        // ⭐ SHEET 2: ALL FILES SUMMARY (tổng hợp TẤT CẢ files từ tất cả folders) - THÊM MỚI
+        createAllFilesSummarySheet(workbook, reports);
 
+        // ⭐ SHEET 3: ALL TIMELINE (tổng hợp timeline của tất cả folders) - THÊM MỚI
+        createAllTimelineSheet(workbook, reports);
+
+        // ⭐ SHEET 4: ALL DELETED FILES (tổng hợp files đã xóa) - THÊM MỚI
+        createAllDeletedFilesSheet(workbook, reports);
+
+        // ⭐ SHEETS 5+: CHI TIẾT TỪNG FOLDER (GIỐNG MODE 2)
+        int folderIndex = 0;
+        for (FolderDetailedReport report : reports) {
             if (report.detailedLog.activityLog.isEmpty()) continue;
 
-            sheetCount++;
-            Sheet sheet = workbook.createSheet("Folder_" + sheetCount);
-            createFolderDetailSheetSimple(sheet, report, workbook);
+            folderIndex++;
+            String folderPrefix = "F" + folderIndex + "_";
+
+            // Tạo 5 sheets chi tiết cho folder này
+            createEnhancedSummarySheetForFolder(workbook, report, folderPrefix);
+            createEnhancedFilesStatusSheetForFolder(workbook, report, folderPrefix);
+            createEnhancedTimelineSheetForFolder(workbook, report, folderPrefix);
+            createEnhancedFileDetailsSheetForFolder(workbook, report, folderPrefix);
+            createEnhancedDeletedFilesSheetForFolder(workbook, report, folderPrefix);
+
+            // Giới hạn để tránh quá nhiều sheets
+            if (folderIndex >= 10) {
+                System.out.println("⚠️  Giới hạn 10 folders đầu tiên (4 + 50 sheets = 54 sheets)");
+                break;
+            }
         }
 
         try (FileOutputStream out = new FileOutputStream(fullPath)) {
@@ -1328,6 +1347,924 @@ public class DetailedActivityService {
         workbook.close();
 
         return new java.io.File(fullPath).getAbsolutePath();
+    }
+
+    /**
+     * 🆕 Tổng hợp TIMELINE của tất cả folders
+     */
+    private void createAllTimelineSheet(Workbook wb, java.util.List<FolderDetailedReport> reports) {
+        Sheet sheet = wb.createSheet("All Timeline");
+
+        // Header style
+        CellStyle headerStyle = wb.createCellStyle();
+        Font headerFont = wb.createFont();
+        headerFont.setBold(true);
+        headerFont.setColor(IndexedColors.WHITE.getIndex());
+        headerStyle.setFont(headerFont);
+        headerStyle.setFillForegroundColor(IndexedColors.BLUE.getIndex());
+        headerStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+        headerStyle.setAlignment(HorizontalAlignment.CENTER);
+        headerStyle.setWrapText(true);
+
+        // Action color styles
+        CellStyle createStyle = wb.createCellStyle();
+        createStyle.setFillForegroundColor(IndexedColors.LIGHT_GREEN.getIndex());
+        createStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+
+        CellStyle deleteStyle = wb.createCellStyle();
+        deleteStyle.setFillForegroundColor(IndexedColors.ROSE.getIndex());
+        deleteStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+
+        CellStyle moveStyle = wb.createCellStyle();
+        moveStyle.setFillForegroundColor(IndexedColors.LIGHT_BLUE.getIndex());
+        moveStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+
+        CellStyle editStyle = wb.createCellStyle();
+        editStyle.setFillForegroundColor(IndexedColors.LIGHT_YELLOW.getIndex());
+        editStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+
+        CellStyle renameStyle = wb.createCellStyle();
+        renameStyle.setFillForegroundColor(IndexedColors.LAVENDER.getIndex());
+        renameStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+
+        CellStyle restoreStyle = wb.createCellStyle();
+        restoreStyle.setFillForegroundColor(IndexedColors.LIGHT_GREEN.getIndex());
+        restoreStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+
+        // Header row
+        Row headerRow = sheet.createRow(0);
+        String[] headers = {"Folder Path", "⏰ Timestamp", "Type", "File/Folder",
+                "File ID", "🔧 Action", "📝 Details", "👤 Actor", "📍 From → To"};
+
+        for (int i = 0; i < headers.length; i++) {
+            Cell cell = headerRow.createCell(i);
+            cell.setCellValue(headers[i]);
+            cell.setCellStyle(headerStyle);
+        }
+
+        // Collect all events from all folders and sort by timestamp
+        java.util.List<ActivityEventWithFolder> allEvents = new java.util.ArrayList<>();
+        for (FolderDetailedReport report : reports) {
+            for (ActivityEvent event : report.detailedLog.activityLog) {
+                ActivityEventWithFolder eventWithFolder = new ActivityEventWithFolder();
+                eventWithFolder.event = event;
+                eventWithFolder.folderPath = report.folderInfo.path;
+                allEvents.add(eventWithFolder);
+            }
+        }
+
+        // Sort by timestamp
+        allEvents.sort(Comparator.comparing(e -> e.event.timestamp));
+
+        // Data rows
+        SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+        int rowNum = 1;
+
+        for (ActivityEventWithFolder item : allEvents) {
+            ActivityEvent event = item.event;
+            Row row = sheet.createRow(rowNum++);
+
+            row.createCell(0).setCellValue(item.folderPath);
+            row.createCell(1).setCellValue(sdf.format(event.timestamp));
+            row.createCell(2).setCellValue(event.isFolder ? "📁 Folder" : "📄 File");
+            row.createCell(3).setCellValue(event.fileName);
+            row.createCell(4).setCellValue(event.fileId);
+
+            Cell actionCell = row.createCell(5);
+            actionCell.setCellValue(event.action);
+
+            // Color code based on action
+            if ("CREATE".equals(event.action)) {
+                actionCell.setCellStyle(createStyle);
+            } else if ("DELETE".equals(event.action) || "AUTO_DELETE".equals(event.action)) {
+                actionCell.setCellStyle(deleteStyle);
+            } else if ("MOVE".equals(event.action)) {
+                actionCell.setCellStyle(moveStyle);
+            } else if ("EDIT".equals(event.action)) {
+                actionCell.setCellStyle(editStyle);
+            } else if ("RENAME".equals(event.action)) {
+                actionCell.setCellStyle(renameStyle);
+            } else if ("RESTORE".equals(event.action)) {
+                actionCell.setCellStyle(restoreStyle);
+            }
+
+            row.createCell(6).setCellValue(event.details);
+            row.createCell(7).setCellValue(event.actor);
+
+            String location = "-";
+            if (!"-".equals(event.fromLocation) || !"-".equals(event.toLocation)) {
+                location = event.fromLocation + " → " + event.toLocation;
+            }
+            row.createCell(8).setCellValue(location);
+        }
+
+        // Auto-size columns
+        for (int i = 0; i < headers.length; i++) {
+            sheet.autoSizeColumn(i);
+        }
+        sheet.setColumnWidth(0, 8000);  // Folder Path
+        sheet.setColumnWidth(1, 4500);  // Timestamp
+        sheet.setColumnWidth(3, 8000);  // File Name
+        sheet.setColumnWidth(4, 6000);  // File ID
+        sheet.setColumnWidth(6, 10000); // Details
+        sheet.setColumnWidth(7, 6000);  // Actor
+        sheet.setColumnWidth(8, 8000);  // From → To
+        sheet.createFreezePane(0, 1);
+    }
+
+    // Helper class
+    static class ActivityEventWithFolder {
+        ActivityEvent event;
+        String folderPath;
+    }
+
+    /**
+     * 🆕 Tổng hợp TẤT CẢ DELETED FILES từ tất cả folders
+     */
+    private void createAllDeletedFilesSheet(Workbook wb, java.util.List<FolderDetailedReport> reports) {
+        Sheet sheet = wb.createSheet("All Deleted Files");
+
+        // Header style (RED background)
+        CellStyle headerStyle = wb.createCellStyle();
+        Font headerFont = wb.createFont();
+        headerFont.setBold(true);
+        headerFont.setColor(IndexedColors.WHITE.getIndex());
+        headerStyle.setFont(headerFont);
+        headerStyle.setFillForegroundColor(IndexedColors.RED.getIndex());
+        headerStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+        headerStyle.setAlignment(HorizontalAlignment.CENTER);
+        headerStyle.setWrapText(true);
+
+        // Color styles
+        CellStyle redBg = wb.createCellStyle();
+        redBg.setFillForegroundColor(IndexedColors.ROSE.getIndex());
+        redBg.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+        Font redFont = wb.createFont();
+        redFont.setBold(true);
+        redBg.setFont(redFont);
+
+        CellStyle yellowBg = wb.createCellStyle();
+        yellowBg.setFillForegroundColor(IndexedColors.LIGHT_YELLOW.getIndex());
+        yellowBg.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+        Font yellowFont = wb.createFont();
+        yellowFont.setBold(true);
+        yellowBg.setFont(yellowFont);
+
+        CellStyle pinkBg = wb.createCellStyle();
+        pinkBg.setFillForegroundColor(IndexedColors.LAVENDER.getIndex());
+        pinkBg.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+
+        // Header row
+        Row headerRow = sheet.createRow(0);
+        String[] headers = {"Folder Path", "Type", "File/Folder Name", "File ID",
+                "❌ Status", "📍 Current Location", "🔧 Last Action", "👤 Who Deleted"};
+
+        for (int i = 0; i < headers.length; i++) {
+            Cell cell = headerRow.createCell(i);
+            cell.setCellValue(headers[i]);
+            cell.setCellStyle(headerStyle);
+        }
+
+        // Data rows
+        int rowNum = 1;
+        boolean hasDeletedFiles = false;
+
+        for (FolderDetailedReport report : reports) {
+            for (FileRecord record : report.detailedLog.fileMap.values()) {
+                if (record.currentStatus != null &&
+                        ("DELETED".equals(record.currentStatus.statusCode) ||
+                                "TRASHED".equals(record.currentStatus.statusCode) ||
+                                "NO_ACCESS".equals(record.currentStatus.statusCode))) {
+
+                    hasDeletedFiles = true;
+                    Row row = sheet.createRow(rowNum++);
+
+                    row.createCell(0).setCellValue(report.folderInfo.path);
+                    row.createCell(1).setCellValue(record.isFolder ? "📁 Folder" : "📄 File");
+                    row.createCell(2).setCellValue(record.name);
+                    row.createCell(3).setCellValue(record.id);
+
+                    Cell statusCell = row.createCell(4);
+                    statusCell.setCellValue(record.currentStatus.status);
+
+                    // Color code based on status
+                    if ("DELETED".equals(record.currentStatus.statusCode)) {
+                        statusCell.setCellStyle(redBg);
+                    } else if ("TRASHED".equals(record.currentStatus.statusCode)) {
+                        statusCell.setCellStyle(yellowBg);
+                    } else if ("NO_ACCESS".equals(record.currentStatus.statusCode)) {
+                        statusCell.setCellStyle(pinkBg);
+                    }
+
+                    row.createCell(5).setCellValue(record.currentStatus.location);
+
+                    // Last action and actor
+                    if (!record.events.isEmpty()) {
+                        ActivityEvent lastEvent = record.events.get(record.events.size() - 1);
+                        row.createCell(6).setCellValue(lastEvent.action);
+                        row.createCell(7).setCellValue(lastEvent.actor);
+                    } else {
+                        row.createCell(6).setCellValue("N/A");
+                        row.createCell(7).setCellValue("N/A");
+                    }
+                }
+            }
+        }
+
+        // If no deleted files
+        if (!hasDeletedFiles) {
+            Row row = sheet.createRow(1);
+            Cell cell = row.createCell(0);
+            cell.setCellValue("✅ No deleted files found!");
+
+            CellStyle greenStyle = wb.createCellStyle();
+            Font greenFont = wb.createFont();
+            greenFont.setBold(true);
+            greenFont.setFontHeightInPoints((short) 12);
+            greenFont.setColor(IndexedColors.GREEN.getIndex());
+            greenStyle.setFont(greenFont);
+            cell.setCellStyle(greenStyle);
+        }
+
+        // Auto-size columns
+        for (int i = 0; i < headers.length; i++) {
+            sheet.autoSizeColumn(i);
+        }
+        sheet.setColumnWidth(0, 8000);  // Folder Path
+        sheet.setColumnWidth(2, 8000);  // File Name
+        sheet.setColumnWidth(3, 6000);  // File ID
+        sheet.setColumnWidth(4, 6000);  // Status
+        sheet.setColumnWidth(5, 8000);  // Location
+        sheet.setColumnWidth(7, 6000);  // Who Deleted
+        sheet.createFreezePane(0, 1);
+    }
+
+    /**
+     * 🆕 Tổng hợp TẤT CẢ FILES từ tất cả folders
+     */
+    private void createAllFilesSummarySheet(Workbook wb, java.util.List<FolderDetailedReport> reports) {
+        Sheet sheet = wb.createSheet("All Files Summary");
+
+        // Header style
+        CellStyle headerStyle = wb.createCellStyle();
+        Font headerFont = wb.createFont();
+        headerFont.setBold(true);
+        headerFont.setColor(IndexedColors.WHITE.getIndex());
+        headerStyle.setFont(headerFont);
+        headerStyle.setFillForegroundColor(IndexedColors.BLUE.getIndex());
+        headerStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+        headerStyle.setAlignment(HorizontalAlignment.CENTER);
+        headerStyle.setWrapText(true);
+
+        // Color styles
+        CellStyle greenBg = wb.createCellStyle();
+        greenBg.setFillForegroundColor(IndexedColors.LIGHT_GREEN.getIndex());
+        greenBg.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+        Font greenFont = wb.createFont();
+        greenFont.setBold(true);
+        greenBg.setFont(greenFont);
+
+        CellStyle yellowBg = wb.createCellStyle();
+        yellowBg.setFillForegroundColor(IndexedColors.LIGHT_YELLOW.getIndex());
+        yellowBg.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+        Font yellowFont = wb.createFont();
+        yellowFont.setBold(true);
+        yellowBg.setFont(yellowFont);
+
+        CellStyle redBg = wb.createCellStyle();
+        redBg.setFillForegroundColor(IndexedColors.ROSE.getIndex());
+        redBg.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+        Font redFont = wb.createFont();
+        redFont.setBold(true);
+        redBg.setFont(redFont);
+
+        // Header row
+        Row headerRow = sheet.createRow(0);
+        String[] headers = {"Folder Path", "Type", "File/Folder Name", "File ID",
+                "🔍 CURRENT STATUS", "📍 Current Location", "🗑️ Trashed?",
+                "📝 Total Events", "🔧 Last Action", "👤 Last Actor"};
+
+        for (int i = 0; i < headers.length; i++) {
+            Cell cell = headerRow.createCell(i);
+            cell.setCellValue(headers[i]);
+            cell.setCellStyle(headerStyle);
+        }
+
+        // Data rows - loop through all folders and all files
+        int rowNum = 1;
+        for (FolderDetailedReport report : reports) {
+            for (FileRecord record : report.detailedLog.fileMap.values()) {
+                Row row = sheet.createRow(rowNum++);
+
+                // Folder Path
+                row.createCell(0).setCellValue(report.folderInfo.path);
+
+                // File info
+                row.createCell(1).setCellValue(record.isFolder ? "📁 Folder" : "📄 File");
+                row.createCell(2).setCellValue(record.name);
+                row.createCell(3).setCellValue(record.id);
+
+                // Current status
+                if (record.currentStatus != null) {
+                    Cell statusCell = row.createCell(4);
+                    statusCell.setCellValue(record.currentStatus.status);
+
+                    if ("EXISTS".equals(record.currentStatus.statusCode)) {
+                        statusCell.setCellStyle(greenBg);
+                    } else if ("TRASHED".equals(record.currentStatus.statusCode)) {
+                        statusCell.setCellStyle(yellowBg);
+                    } else if ("DELETED".equals(record.currentStatus.statusCode) ||
+                            "NO_ACCESS".equals(record.currentStatus.statusCode)) {
+                        statusCell.setCellStyle(redBg);
+                    }
+
+                    row.createCell(5).setCellValue(record.currentStatus.location);
+                    row.createCell(6).setCellValue(record.currentStatus.trashed ? "✓ YES" : "✗ NO");
+                } else {
+                    row.createCell(4).setCellValue("N/A");
+                    row.createCell(5).setCellValue("N/A");
+                    row.createCell(6).setCellValue("N/A");
+                }
+
+                row.createCell(7).setCellValue(record.events.size());
+
+                // Last action
+                if (!record.events.isEmpty()) {
+                    ActivityEvent lastEvent = record.events.get(record.events.size() - 1);
+                    row.createCell(8).setCellValue(lastEvent.action);
+                    row.createCell(9).setCellValue(lastEvent.actor);
+                } else {
+                    row.createCell(8).setCellValue("N/A");
+                    row.createCell(9).setCellValue("N/A");
+                }
+            }
+        }
+
+        // Auto-size columns
+        for (int i = 0; i < headers.length; i++) {
+            sheet.autoSizeColumn(i);
+        }
+        sheet.setColumnWidth(0, 8000);  // Folder Path
+        sheet.setColumnWidth(2, 8000);  // File Name
+        sheet.setColumnWidth(3, 6000);  // File ID
+        sheet.setColumnWidth(4, 6000);  // Status
+        sheet.setColumnWidth(5, 8000);  // Location
+        sheet.setColumnWidth(9, 6000);  // Actor
+        sheet.createFreezePane(0, 1);
+    }
+
+
+    /**
+     * 🆕 Tạo Summary sheet cho 1 folder (với prefix)
+     */
+    private void createEnhancedSummarySheetForFolder(Workbook wb, FolderDetailedReport report, String prefix) {
+        String sheetName = prefix + "Summary";
+        // Giới hạn tên sheet (Excel max 31 chars)
+        if (sheetName.length() > 31) {
+            sheetName = sheetName.substring(0, 31);
+        }
+        Sheet sheet = wb.createSheet(sheetName);
+
+        // Title style
+        CellStyle titleStyle = wb.createCellStyle();
+        Font titleFont = wb.createFont();
+        titleFont.setBold(true);
+        titleFont.setFontHeightInPoints((short) 14);
+        titleStyle.setFont(titleFont);
+
+        // Bold style
+        CellStyle boldStyle = wb.createCellStyle();
+        Font boldFont = wb.createFont();
+        boldFont.setBold(true);
+        boldStyle.setFont(boldFont);
+
+        // Color styles
+        CellStyle greenStyle = wb.createCellStyle();
+        greenStyle.setFillForegroundColor(IndexedColors.LIGHT_GREEN.getIndex());
+        greenStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+
+        CellStyle yellowStyle = wb.createCellStyle();
+        yellowStyle.setFillForegroundColor(IndexedColors.LIGHT_YELLOW.getIndex());
+        yellowStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+
+        CellStyle redStyle = wb.createCellStyle();
+        redStyle.setFillForegroundColor(IndexedColors.ROSE.getIndex());
+        redStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+
+        // Title
+        Row row0 = sheet.createRow(0);
+        Cell titleCell = row0.createCell(0);
+        titleCell.setCellValue("📊 ACTIVITY LOG - ENHANCED REPORT");
+        titleCell.setCellStyle(titleStyle);
+
+        // Folder info
+        sheet.createRow(2).createCell(0).setCellValue("Folder Name:");
+        sheet.getRow(2).getCell(0).setCellStyle(boldStyle);
+        sheet.getRow(2).createCell(1).setCellValue(report.folderInfo.name);
+
+        sheet.createRow(3).createCell(0).setCellValue("Folder Path:");
+        sheet.getRow(3).getCell(0).setCellStyle(boldStyle);
+        sheet.getRow(3).createCell(1).setCellValue(report.folderInfo.path);
+
+        sheet.createRow(4).createCell(0).setCellValue("Folder ID:");
+        sheet.getRow(4).getCell(0).setCellStyle(boldStyle);
+        sheet.getRow(4).createCell(1).setCellValue(report.folderInfo.id);
+
+        sheet.createRow(5).createCell(0).setCellValue("Total Files/Folders:");
+        sheet.getRow(5).getCell(0).setCellStyle(boldStyle);
+        sheet.getRow(5).createCell(1).setCellValue(report.detailedLog.fileMap.size());
+
+        sheet.createRow(6).createCell(0).setCellValue("Total Events:");
+        sheet.getRow(6).getCell(0).setCellStyle(boldStyle);
+        sheet.getRow(6).createCell(1).setCellValue(report.detailedLog.activityLog.size());
+
+        sheet.createRow(7).createCell(0).setCellValue("Report Generated:");
+        sheet.getRow(7).getCell(0).setCellStyle(boldStyle);
+        sheet.getRow(7).createCell(1).setCellValue(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()));
+
+        // Current Status Statistics
+        Map<String, Integer> statusStats = new HashMap<>();
+        statusStats.put("EXISTS", 0);
+        statusStats.put("TRASHED", 0);
+        statusStats.put("DELETED", 0);
+        statusStats.put("NO_ACCESS", 0);
+        statusStats.put("ERROR", 0);
+
+        for (FileRecord record : report.detailedLog.fileMap.values()) {
+            if (record.currentStatus != null) {
+                String code = record.currentStatus.statusCode;
+                statusStats.put(code, statusStats.getOrDefault(code, 0) + 1);
+            }
+        }
+
+        Row row9 = sheet.createRow(9);
+        Cell statTitle = row9.createCell(0);
+        statTitle.setCellValue("📈 Current Status Statistics:");
+        statTitle.setCellStyle(boldStyle);
+
+        sheet.createRow(10).createCell(0).setCellValue("✅ Still Exists");
+        Cell existsCell = sheet.getRow(10).createCell(1);
+        existsCell.setCellValue(statusStats.get("EXISTS"));
+        existsCell.setCellStyle(greenStyle);
+
+        sheet.createRow(11).createCell(0).setCellValue("🗑️ In Trash");
+        Cell trashedCell = sheet.getRow(11).createCell(1);
+        trashedCell.setCellValue(statusStats.get("TRASHED"));
+        trashedCell.setCellStyle(yellowStyle);
+
+        sheet.createRow(12).createCell(0).setCellValue("❌ Permanently Deleted");
+        Cell deletedCell = sheet.getRow(12).createCell(1);
+        deletedCell.setCellValue(statusStats.get("DELETED"));
+        deletedCell.setCellStyle(redStyle);
+
+        sheet.createRow(13).createCell(0).setCellValue("🔒 No Access");
+        sheet.getRow(13).createCell(1).setCellValue(statusStats.get("NO_ACCESS"));
+
+        sheet.createRow(14).createCell(0).setCellValue("⚠️ Error");
+        sheet.getRow(14).createCell(1).setCellValue(statusStats.get("ERROR"));
+
+        sheet.autoSizeColumn(0);
+        sheet.autoSizeColumn(1);
+        sheet.setColumnWidth(0, 5000);
+        sheet.setColumnWidth(1, 10000);
+    }
+
+    /**
+     * 🆕 Tạo Files Status sheet cho 1 folder (với prefix)
+     */
+    private void createEnhancedFilesStatusSheetForFolder(Workbook wb, FolderDetailedReport report, String prefix) {
+        String sheetName = prefix + "Files_Status";
+        if (sheetName.length() > 31) {
+            sheetName = sheetName.substring(0, 31);
+        }
+        Sheet sheet = wb.createSheet(sheetName);
+
+        // Header style
+        CellStyle headerStyle = wb.createCellStyle();
+        Font headerFont = wb.createFont();
+        headerFont.setBold(true);
+        headerFont.setColor(IndexedColors.WHITE.getIndex());
+        headerStyle.setFont(headerFont);
+        headerStyle.setFillForegroundColor(IndexedColors.BLUE.getIndex());
+        headerStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+        headerStyle.setAlignment(HorizontalAlignment.CENTER);
+        headerStyle.setWrapText(true);
+
+        // Color styles
+        CellStyle greenBg = wb.createCellStyle();
+        greenBg.setFillForegroundColor(IndexedColors.LIGHT_GREEN.getIndex());
+        greenBg.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+        Font greenFont = wb.createFont();
+        greenFont.setBold(true);
+        greenBg.setFont(greenFont);
+
+        CellStyle yellowBg = wb.createCellStyle();
+        yellowBg.setFillForegroundColor(IndexedColors.LIGHT_YELLOW.getIndex());
+        yellowBg.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+        Font yellowFont = wb.createFont();
+        yellowFont.setBold(true);
+        yellowBg.setFont(yellowFont);
+
+        CellStyle redBg = wb.createCellStyle();
+        redBg.setFillForegroundColor(IndexedColors.ROSE.getIndex());
+        redBg.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+        Font redFont = wb.createFont();
+        redFont.setBold(true);
+        redBg.setFont(redFont);
+
+        // Header row
+        Row headerRow = sheet.createRow(0);
+        String[] headers = {"Type", "File/Folder Name", "File ID", "🔍 CURRENT STATUS",
+                "📍 Current Location", "🗑️ Trashed?", "📝 Total Events",
+                "🔧 Last Action", "👤 Last Actor"};
+
+        for (int i = 0; i < headers.length; i++) {
+            Cell cell = headerRow.createCell(i);
+            cell.setCellValue(headers[i]);
+            cell.setCellStyle(headerStyle);
+        }
+
+        // Data rows
+        int rowNum = 1;
+        for (FileRecord record : report.detailedLog.fileMap.values()) {
+            Row row = sheet.createRow(rowNum++);
+
+            row.createCell(0).setCellValue(record.isFolder ? "📁 Folder" : "📄 File");
+            row.createCell(1).setCellValue(record.name);
+            row.createCell(2).setCellValue(record.id);
+
+            if (record.currentStatus != null) {
+                Cell statusCell = row.createCell(3);
+                statusCell.setCellValue(record.currentStatus.status);
+
+                // Color code based on status
+                if ("EXISTS".equals(record.currentStatus.statusCode)) {
+                    statusCell.setCellStyle(greenBg);
+                } else if ("TRASHED".equals(record.currentStatus.statusCode)) {
+                    statusCell.setCellStyle(yellowBg);
+                } else if ("DELETED".equals(record.currentStatus.statusCode) ||
+                        "NO_ACCESS".equals(record.currentStatus.statusCode)) {
+                    statusCell.setCellStyle(redBg);
+                }
+
+                row.createCell(4).setCellValue(record.currentStatus.location);
+                row.createCell(5).setCellValue(record.currentStatus.trashed ? "✓ YES" : "✗ NO");
+            } else {
+                row.createCell(3).setCellValue("N/A");
+                row.createCell(4).setCellValue("N/A");
+                row.createCell(5).setCellValue("N/A");
+            }
+
+            row.createCell(6).setCellValue(record.events.size());
+
+            // Last action
+            if (!record.events.isEmpty()) {
+                ActivityEvent lastEvent = record.events.get(record.events.size() - 1);
+                row.createCell(7).setCellValue(lastEvent.action);
+                row.createCell(8).setCellValue(lastEvent.actor);
+            } else {
+                row.createCell(7).setCellValue("N/A");
+                row.createCell(8).setCellValue("N/A");
+            }
+        }
+
+        // Auto-size columns
+        for (int i = 0; i < headers.length; i++) {
+            sheet.autoSizeColumn(i);
+        }
+        sheet.setColumnWidth(1, 8000);  // File Name
+        sheet.setColumnWidth(2, 6000);  // File ID
+        sheet.setColumnWidth(3, 6000);  // Status
+        sheet.setColumnWidth(4, 8000);  // Location
+        sheet.setColumnWidth(8, 6000);  // Actor
+        sheet.createFreezePane(0, 1);
+    }
+
+    /**
+     * 🆕 Tạo Timeline sheet cho 1 folder (với prefix)
+     */
+    private void createEnhancedTimelineSheetForFolder(Workbook wb, FolderDetailedReport report, String prefix) {
+        String sheetName = prefix + "Timeline";
+        if (sheetName.length() > 31) {
+            sheetName = sheetName.substring(0, 31);
+        }
+        Sheet sheet = wb.createSheet(sheetName);
+
+        // Header style
+        CellStyle headerStyle = wb.createCellStyle();
+        Font headerFont = wb.createFont();
+        headerFont.setBold(true);
+        headerFont.setColor(IndexedColors.WHITE.getIndex());
+        headerStyle.setFont(headerFont);
+        headerStyle.setFillForegroundColor(IndexedColors.BLUE.getIndex());
+        headerStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+        headerStyle.setAlignment(HorizontalAlignment.CENTER);
+        headerStyle.setWrapText(true);
+
+        // Action color styles
+        CellStyle createStyle = wb.createCellStyle();
+        createStyle.setFillForegroundColor(IndexedColors.LIGHT_GREEN.getIndex());
+        createStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+
+        CellStyle deleteStyle = wb.createCellStyle();
+        deleteStyle.setFillForegroundColor(IndexedColors.ROSE.getIndex());
+        deleteStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+
+        CellStyle moveStyle = wb.createCellStyle();
+        moveStyle.setFillForegroundColor(IndexedColors.LIGHT_BLUE.getIndex());
+        moveStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+
+        CellStyle editStyle = wb.createCellStyle();
+        editStyle.setFillForegroundColor(IndexedColors.LIGHT_YELLOW.getIndex());
+        editStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+
+        CellStyle renameStyle = wb.createCellStyle();
+        renameStyle.setFillForegroundColor(IndexedColors.LAVENDER.getIndex());
+        renameStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+
+        CellStyle restoreStyle = wb.createCellStyle();
+        restoreStyle.setFillForegroundColor(IndexedColors.LIGHT_GREEN.getIndex());
+        restoreStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+
+        // Header row
+        Row headerRow = sheet.createRow(0);
+        String[] headers = {"⏰ Timestamp", "Type", "File/Folder", "File ID",
+                "🔧 Action", "📝 Details", "👤 Actor", "📍 From → To"};
+
+        for (int i = 0; i < headers.length; i++) {
+            Cell cell = headerRow.createCell(i);
+            cell.setCellValue(headers[i]);
+            cell.setCellStyle(headerStyle);
+        }
+
+        // Data rows
+        SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+        int rowNum = 1;
+
+        for (ActivityEvent event : report.detailedLog.activityLog) {
+            Row row = sheet.createRow(rowNum++);
+
+            row.createCell(0).setCellValue(sdf.format(event.timestamp));
+            row.createCell(1).setCellValue(event.isFolder ? "📁 Folder" : "📄 File");
+            row.createCell(2).setCellValue(event.fileName);
+            row.createCell(3).setCellValue(event.fileId);
+
+            Cell actionCell = row.createCell(4);
+            actionCell.setCellValue(event.action);
+
+            // Color code based on action
+            if ("CREATE".equals(event.action)) {
+                actionCell.setCellStyle(createStyle);
+            } else if ("DELETE".equals(event.action) || "AUTO_DELETE".equals(event.action)) {
+                actionCell.setCellStyle(deleteStyle);
+            } else if ("MOVE".equals(event.action)) {
+                actionCell.setCellStyle(moveStyle);
+            } else if ("EDIT".equals(event.action)) {
+                actionCell.setCellStyle(editStyle);
+            } else if ("RENAME".equals(event.action)) {
+                actionCell.setCellStyle(renameStyle);
+            } else if ("RESTORE".equals(event.action)) {
+                actionCell.setCellStyle(restoreStyle);
+            }
+
+            row.createCell(5).setCellValue(event.details);
+            row.createCell(6).setCellValue(event.actor);
+
+            String location = "-";
+            if (!"-".equals(event.fromLocation) || !"-".equals(event.toLocation)) {
+                location = event.fromLocation + " → " + event.toLocation;
+            }
+            row.createCell(7).setCellValue(location);
+        }
+
+        // Auto-size columns
+        for (int i = 0; i < headers.length; i++) {
+            sheet.autoSizeColumn(i);
+        }
+        sheet.setColumnWidth(0, 4500);  // Timestamp
+        sheet.setColumnWidth(2, 8000);  // File Name
+        sheet.setColumnWidth(3, 6000);  // File ID
+        sheet.setColumnWidth(5, 10000); // Details
+        sheet.setColumnWidth(6, 6000);  // Actor
+        sheet.setColumnWidth(7, 8000);  // From → To
+        sheet.createFreezePane(0, 1);
+    }
+
+    /**
+     * 🆕 Tạo File Details sheet cho 1 folder (với prefix)
+     */
+    private void createEnhancedFileDetailsSheetForFolder(Workbook wb, FolderDetailedReport report, String prefix) {
+        String sheetName = prefix + "File_Details";
+        if (sheetName.length() > 31) {
+            sheetName = sheetName.substring(0, 31);
+        }
+        Sheet sheet = wb.createSheet(sheetName);
+
+        // Header style
+        CellStyle headerStyle = wb.createCellStyle();
+        Font headerFont = wb.createFont();
+        headerFont.setBold(true);
+        headerFont.setColor(IndexedColors.WHITE.getIndex());
+        headerStyle.setFont(headerFont);
+        headerStyle.setFillForegroundColor(IndexedColors.BLUE.getIndex());
+        headerStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+        headerStyle.setAlignment(HorizontalAlignment.CENTER);
+        headerStyle.setWrapText(true);
+
+        // File header style
+        CellStyle fileHeaderStyle = wb.createCellStyle();
+        Font fileHeaderFont = wb.createFont();
+        fileHeaderFont.setBold(true);
+        fileHeaderFont.setFontHeightInPoints((short) 12);
+        fileHeaderStyle.setFont(fileHeaderFont);
+        fileHeaderStyle.setFillForegroundColor(IndexedColors.GREY_25_PERCENT.getIndex());
+        fileHeaderStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+
+        // Column headers
+        Row headerRow = sheet.createRow(0);
+        String[] headers = {"File/Folder", "Event #", "⏰ Timestamp", "🔧 Action",
+                "📝 Details", "👤 Actor", "📍 From → To", "🔍 Current Status"};
+
+        for (int i = 0; i < headers.length; i++) {
+            Cell cell = headerRow.createCell(i);
+            cell.setCellValue(headers[i]);
+            cell.setCellStyle(headerStyle);
+        }
+
+        // Data rows
+        SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+        int rowNum = 1;
+
+        for (FileRecord record : report.detailedLog.fileMap.values()) {
+            // File header row
+            Row fileRow = sheet.createRow(rowNum++);
+            Cell fileCell = fileRow.createCell(0);
+            fileCell.setCellValue((record.isFolder ? "📁 " : "📄 ") + record.name);
+            fileCell.setCellStyle(fileHeaderStyle);
+
+            // Current status in header row
+            if (record.currentStatus != null) {
+                Cell statusCell = fileRow.createCell(7);
+                statusCell.setCellValue(record.currentStatus.status);
+                statusCell.setCellStyle(fileHeaderStyle);
+            }
+
+            // Events for this file
+            for (int i = 0; i < record.events.size(); i++) {
+                ActivityEvent event = record.events.get(i);
+                Row row = sheet.createRow(rowNum++);
+
+                row.createCell(0).setCellValue("");  // Indent
+                row.createCell(1).setCellValue(i + 1);
+                row.createCell(2).setCellValue(sdf.format(event.timestamp));
+                row.createCell(3).setCellValue(event.action);
+                row.createCell(4).setCellValue(event.details);
+                row.createCell(5).setCellValue(event.actor);
+
+                String location = "-";
+                if (!"-".equals(event.fromLocation) || !"-".equals(event.toLocation)) {
+                    location = event.fromLocation + " → " + event.toLocation;
+                }
+                row.createCell(6).setCellValue(location);
+            }
+
+            // Blank row between files
+            rowNum++;
+        }
+
+        // Auto-size columns
+        for (int i = 0; i < headers.length; i++) {
+            sheet.autoSizeColumn(i);
+        }
+        sheet.setColumnWidth(0, 8000);  // File Name
+        sheet.setColumnWidth(1, 2000);  // Event #
+        sheet.setColumnWidth(2, 4500);  // Timestamp
+        sheet.setColumnWidth(4, 10000); // Details
+        sheet.setColumnWidth(5, 6000);  // Actor
+        sheet.setColumnWidth(6, 8000);  // From → To
+        sheet.setColumnWidth(7, 6000);  // Current Status
+        sheet.createFreezePane(0, 1);
+    }
+
+    /**
+     * 🆕 Tạo Deleted Files sheet cho 1 folder (với prefix)
+     */
+    private void createEnhancedDeletedFilesSheetForFolder(Workbook wb, FolderDetailedReport report, String prefix) {
+        String sheetName = prefix + "Deleted";
+        if (sheetName.length() > 31) {
+            sheetName = sheetName.substring(0, 31);
+        }
+        Sheet sheet = wb.createSheet(sheetName);
+
+        // Header style (RED background)
+        CellStyle headerStyle = wb.createCellStyle();
+        Font headerFont = wb.createFont();
+        headerFont.setBold(true);
+        headerFont.setColor(IndexedColors.WHITE.getIndex());
+        headerStyle.setFont(headerFont);
+        headerStyle.setFillForegroundColor(IndexedColors.RED.getIndex());
+        headerStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+        headerStyle.setAlignment(HorizontalAlignment.CENTER);
+        headerStyle.setWrapText(true);
+
+        // Color styles
+        CellStyle redBg = wb.createCellStyle();
+        redBg.setFillForegroundColor(IndexedColors.ROSE.getIndex());
+        redBg.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+        Font redFont = wb.createFont();
+        redFont.setBold(true);
+        redBg.setFont(redFont);
+
+        CellStyle yellowBg = wb.createCellStyle();
+        yellowBg.setFillForegroundColor(IndexedColors.LIGHT_YELLOW.getIndex());
+        yellowBg.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+        Font yellowFont = wb.createFont();
+        yellowFont.setBold(true);
+        yellowBg.setFont(yellowFont);
+
+        CellStyle pinkBg = wb.createCellStyle();
+        pinkBg.setFillForegroundColor(IndexedColors.LAVENDER.getIndex());
+        pinkBg.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+
+        // Header row
+        Row headerRow = sheet.createRow(0);
+        String[] headers = {"Type", "File/Folder Name", "File ID", "❌ Status",
+                "📍 Current Location", "🔧 Last Action", "👤 Who Deleted"};
+
+        for (int i = 0; i < headers.length; i++) {
+            Cell cell = headerRow.createCell(i);
+            cell.setCellValue(headers[i]);
+            cell.setCellStyle(headerStyle);
+        }
+
+        // Data rows
+        int rowNum = 1;
+        boolean hasDeletedFiles = false;
+
+        for (FileRecord record : report.detailedLog.fileMap.values()) {
+            if (record.currentStatus != null &&
+                    ("DELETED".equals(record.currentStatus.statusCode) ||
+                            "TRASHED".equals(record.currentStatus.statusCode) ||
+                            "NO_ACCESS".equals(record.currentStatus.statusCode))) {
+
+                hasDeletedFiles = true;
+                Row row = sheet.createRow(rowNum++);
+
+                row.createCell(0).setCellValue(record.isFolder ? "📁 Folder" : "📄 File");
+                row.createCell(1).setCellValue(record.name);
+                row.createCell(2).setCellValue(record.id);
+
+                Cell statusCell = row.createCell(3);
+                statusCell.setCellValue(record.currentStatus.status);
+
+                // Color code based on status
+                if ("DELETED".equals(record.currentStatus.statusCode)) {
+                    statusCell.setCellStyle(redBg);
+                } else if ("TRASHED".equals(record.currentStatus.statusCode)) {
+                    statusCell.setCellStyle(yellowBg);
+                } else if ("NO_ACCESS".equals(record.currentStatus.statusCode)) {
+                    statusCell.setCellStyle(pinkBg);
+                }
+
+                row.createCell(4).setCellValue(record.currentStatus.location);
+
+                // Last action and actor
+                if (!record.events.isEmpty()) {
+                    ActivityEvent lastEvent = record.events.get(record.events.size() - 1);
+                    row.createCell(5).setCellValue(lastEvent.action);
+                    row.createCell(6).setCellValue(lastEvent.actor);
+                } else {
+                    row.createCell(5).setCellValue("N/A");
+                    row.createCell(6).setCellValue("N/A");
+                }
+            }
+        }
+
+        // If no deleted files
+        if (!hasDeletedFiles) {
+            Row row = sheet.createRow(1);
+            Cell cell = row.createCell(0);
+            cell.setCellValue("✅ No deleted files found!");
+
+            CellStyle greenStyle = wb.createCellStyle();
+            Font greenFont = wb.createFont();
+            greenFont.setBold(true);
+            greenFont.setFontHeightInPoints((short) 12);
+            greenFont.setColor(IndexedColors.GREEN.getIndex());
+            greenStyle.setFont(greenFont);
+            cell.setCellStyle(greenStyle);
+        }
+
+        // Auto-size columns
+        for (int i = 0; i < headers.length; i++) {
+            sheet.autoSizeColumn(i);
+        }
+        sheet.setColumnWidth(1, 8000);  // File Name
+        sheet.setColumnWidth(2, 6000);  // File ID
+        sheet.setColumnWidth(3, 6000);  // Status
+        sheet.setColumnWidth(4, 8000);  // Location
+        sheet.setColumnWidth(6, 6000);  // Who Deleted
+        sheet.createFreezePane(0, 1);
     }
 
     /**
@@ -1345,22 +2282,44 @@ public class DetailedActivityService {
         String fullPath = Config.OUTPUT_DIRECTORY + fileName;
         Workbook workbook = new XSSFWorkbook();
 
-        // Summary tổ chức
+        // ⭐ SHEET 1: Organization Summary
         createOrganizationSummarySheet(workbook, allUserReports);
 
-        // Sheet cho từng user (tối đa 20)
-        int userCount = 0;
-        for (java.util.Map.Entry<String, java.util.List<FolderDetailedReport>> entry : allUserReports.entrySet()) {
-            if (userCount >= 20) break;
+        // ⭐ SHEETS 2+: CHI TIẾT TỪNG USER + FOLDERS
+        int totalSheets = 1; // Đã có Organization Summary
+        int maxSheets = 250; // Excel limit
 
+        for (java.util.Map.Entry<String, java.util.List<FolderDetailedReport>> entry : allUserReports.entrySet()) {
             String userEmail = entry.getKey();
             java.util.List<FolderDetailedReport> userReports = entry.getValue();
 
             if (userReports.isEmpty()) continue;
 
-            userCount++;
-            Sheet sheet = workbook.createSheet("User_" + userCount);
-            createUserSummarySheet(sheet, userReports, userEmail, workbook);
+            String userPrefix = userEmail.split("@")[0].substring(0, Math.min(3, userEmail.length())) + "_";
+
+            // Giới hạn folders cho mỗi user
+            int folderCount = 0;
+            for (FolderDetailedReport report : userReports) {
+                if (report.detailedLog.activityLog.isEmpty()) continue;
+                if (totalSheets >= maxSheets - 5) break; // Dành chỗ cho 5 sheets của folder cuối
+
+                folderCount++;
+                String prefix = userPrefix + "F" + folderCount + "_";
+
+                // Tạo 5 sheets chi tiết
+                createEnhancedSummarySheetForFolder(workbook, report, prefix);
+                createEnhancedFilesStatusSheetForFolder(workbook, report, prefix);
+                createEnhancedTimelineSheetForFolder(workbook, report, prefix);
+                createEnhancedFileDetailsSheetForFolder(workbook, report, prefix);
+                createEnhancedDeletedFilesSheetForFolder(workbook, report, prefix);
+
+                totalSheets += 5;
+
+                // Giới hạn 3 folders/user để tránh quá nhiều sheets
+                if (folderCount >= 3) break;
+            }
+
+            System.out.println("✓ Đã export " + folderCount + " folders cho " + userEmail);
         }
 
         try (FileOutputStream out = new FileOutputStream(fullPath)) {
@@ -1368,6 +2327,7 @@ public class DetailedActivityService {
         }
         workbook.close();
 
+        System.out.println("📊 Tổng số sheets: " + totalSheets);
         return new java.io.File(fullPath).getAbsolutePath();
     }
 
