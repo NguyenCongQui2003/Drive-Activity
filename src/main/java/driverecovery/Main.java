@@ -27,38 +27,50 @@ public class Main {
 
 
     public static void main(String[] args) {
-        System.out.println("========================================");
-        System.out.println("   DRIVE RECOVERY TOOL");
-        System.out.println("========================================");
-        System.out.println("Phát triển bởi: Drive Recovery Team");
-        System.out.println("Version: 2.0.0\n");
+        // ⭐ LAUNCH GUI (mặc định) / CLI qua flag --cli
+        if (args.length > 0 && "--cli".equals(args[0])) {
+            runCLI();
+        } else {
+            MainWindow.launch();
+        }
+    }
 
-        // ⭐ CHỌN MODE
-        System.out.println("📋 CHỌN CHE ĐỘ CHẠY:");
-        System.out.println("  1. Normal Mode - Recovery files cho tất cả users");
-        System.out.println("  2. Detailed Activity Log - Phân tích chi tiết 1 folder");
-        System.out.println("  3. Detailed Activity Log - Phân tích 1 user (tất cả folders)");  // 🆕 THÊM
-        System.out.println("  4. Detailed Activity Log - Phân tích toàn bộ users");           // 🆕 THÊM
-        System.out.print("\nNhập lựa chọn (1/2/3/4): ");  // 🆕 SỬA
+    /** Chế độ CLI cũ (giữ lại để debug, chạy qua --cli flag) */
+    private static void runCLI() {
+        System.out.println("========================================");
+        System.out.println("   DRIVE RECOVERY TOOL - CLI MODE");
+        System.out.println("========================================");
+
+        System.out.println("📋 CHỌN CHẾ ĐỘ CHẠY:");
+        System.out.println("  1. Normal Mode - Recovery files");
+        System.out.println("  2. Detailed Activity Log - 1 folder");
+        System.out.println("  3. Detailed Activity Log - 1 user");
+        System.out.println("  4. Detailed Activity Log - toàn bộ users");
+        System.out.print("\nNhập lựa chọn (1/2/3/4): ");
 
         Scanner scanner = new Scanner(System.in);
         String mode = scanner.nextLine().trim();
 
         if (MODE_DETAILED_ACTIVITY.equals(mode)) {
             runDetailedActivityMode(scanner);
-        } else if (MODE_DETAILED_USER.equals(mode)) {        // 🆕 THÊM
-            runDetailedActivityUserMode(scanner);             // 🆕 THÊM
-        } else if (MODE_DETAILED_ALL_USERS.equals(mode)) {   // 🆕 THÊM
-            runDetailedActivityAllUsersMode(scanner);         // 🆕 THÊM
+        } else if (MODE_DETAILED_USER.equals(mode)) {
+            runDetailedActivityUserMode(scanner);
+        } else if (MODE_DETAILED_ALL_USERS.equals(mode)) {
+            runDetailedActivityAllUsersMode(scanner);
         } else {
             runNormalMode();
         }
-
         scanner.close();
     }
 
     /**
      * ⭐ MODE 1: Normal Recovery Mode (như cũ)
+     */
+    /**
+     * ⭐ MODE 1: Normal Recovery Mode - FIXED
+     */
+    /**
+     * ⭐ MODE 1: Normal Recovery Mode - FIXED
      */
     private static void runNormalMode() {
         System.out.println("\n🔧 Đang chạy NORMAL MODE...\n");
@@ -66,7 +78,6 @@ public class Main {
         try {
             System.out.println("👥 Danh sách users cần kiểm tra: " + Config.USERS_TO_CHECK.size());
 
-            // ✅ LOOP QUA TỪNG USER - MỖI USER TẠO 1 FILE EXCEL RIÊNG
             for (int i = 0; i < Config.USERS_TO_CHECK.size(); i++) {
                 String userEmail = Config.USERS_TO_CHECK.get(i);
 
@@ -75,37 +86,37 @@ public class Main {
                 System.out.println("╚════════════════════════════════════════════════════════════");
 
                 try {
-                    // 🆕 TẠO SERVICE MỚI CHO TỪNG USER
+                    // ✅ FIX: TẠO SERVICE CHO TỪNG USER CỤ THỂ
                     System.out.println("🔧 Đang khởi tạo services cho user: " + userEmail);
-                    Drive driveService = createDriveService();
-                    DriveActivity activityService = createActivityService();
+                    Drive driveService = createDriveServiceForUser(userEmail);  // ← ĐỔI TỪ createDriveService()
+                    DriveActivity activityService = createActivityServiceForUser(userEmail);  // ← ĐỔI TỪ createActivityService()
                     System.out.println("✅ Services đã sẵn sàng\n");
 
-                    // 🆕 Hiển thị cấu hình filter
+                    // Hiển thị cấu hình filter
                     System.out.println("⚙️  CẤU HÌNH ACTIVITY FILTER:");
-                    if (Config.ACTIVITY_DAYS > 0) {
-                        System.out.println("   - Đọc activity từ " + Config.ACTIVITY_DAYS + " ngày trước");
+                    if (Config.getActivityDays() > 0) {
+                        System.out.println("   - Đọc activity từ " + Config.getActivityDays() + " ngày trước");
                     } else {
                         System.out.println("   - Đọc activity từ quá khứ (không giới hạn)");
                     }
 
-                    if (Config.ACTIVITY_END_DATE != null && !Config.ACTIVITY_END_DATE.isEmpty()) {
-                        System.out.println("   - ✂️  CẮT TẠI: " + Config.ACTIVITY_END_DATE + " (không đọc activity sau ngày này)");
+                    if (Config.getActivityEndDate() != null && !Config.getActivityEndDate().isEmpty()) {
+                        System.out.println("   - ✂️  CẮT TẠI: " + Config.getActivityEndDate() + " (không đọc activity sau ngày này)");
                     } else {
                         System.out.println("   - Đọc đến hiện tại (không giới hạn ngày kết thúc)");
                     }
                     System.out.println("");
 
-                    // 🆕 TẠO RECOVERY SERVICE MỚI CHO TỪNG USER
+                    // TẠO RECOVERY SERVICE MỚI CHO TỪNG USER
                     DriveRecoveryService recoveryService = new DriveRecoveryService(
                             driveService,
                             activityService
                     );
 
-                    // 🆕 XỬ LÝ DRIVE CỦA USER NÀY
+                    // XỬ LÝ DRIVE CỦA USER NÀY
                     recoveryService.processUserDrive(userEmail);
 
-                    // 🆕 TẠO FILE EXCEL RIÊNG CHO USER NÀY NGAY SAU KHI XỬ LÝ XONG
+                    // TẠO FILE EXCEL RIÊNG CHO USER NÀY
                     System.out.println("\n╔════════════════════════════════════════════════════════════");
                     System.out.println("║ TẠO BÁO CÁO EXCEL CHO: " + userEmail);
                     System.out.println("╚════════════════════════════════════════════════════════════");
@@ -125,7 +136,6 @@ public class Main {
                 }
             }
 
-            // ✅ KẾT THÚC - ĐÃ TẠO XONG TẤT CẢ FILE EXCEL
             System.out.println("\n========================================");
             System.out.println("   ✅ HOÀN THÀNH TẤT CẢ USERS");
             System.out.println("========================================");
@@ -171,14 +181,14 @@ public class Main {
 
 // 🆕 THÊM ĐOẠN NÀY - Hiển thị cấu hình filter
             System.out.println("⚙️  CẤU HÌNH ACTIVITY FILTER:");
-            if (Config.ACTIVITY_DAYS > 0) {
-                System.out.println("   - Đọc activity từ " + Config.ACTIVITY_DAYS + " ngày trước");
+            if (Config.getActivityDays() > 0) {
+                System.out.println("   - Đọc activity từ " + Config.getActivityDays() + " ngày trước");
             } else {
                 System.out.println("   - Đọc activity từ quá khứ (không giới hạn)");
             }
 
-            if (Config.ACTIVITY_END_DATE != null && !Config.ACTIVITY_END_DATE.isEmpty()) {
-                System.out.println("   - ✂️  CẮT TẠI: " + Config.ACTIVITY_END_DATE + " (không đọc activity sau ngày này)");
+            if (Config.getActivityEndDate() != null && !Config.getActivityEndDate().isEmpty()) {
+                System.out.println("   - ✂️  CẮT TẠI: " + Config.getActivityEndDate() + " (không đọc activity sau ngày này)");
             } else {
                 System.out.println("   - Đọc đến hiện tại (không giới hạn ngày kết thúc)");
             }
@@ -240,14 +250,14 @@ public class Main {
 
 // 🆕 THÊM ĐOẠN NÀY - Hiển thị cấu hình filter
             System.out.println("⚙️  CẤU HÌNH ACTIVITY FILTER:");
-            if (Config.ACTIVITY_DAYS > 0) {
-                System.out.println("   - Đọc activity từ " + Config.ACTIVITY_DAYS + " ngày trước");
+            if (Config.getActivityDays() > 0) {
+                System.out.println("   - Đọc activity từ " + Config.getActivityDays() + " ngày trước");
             } else {
                 System.out.println("   - Đọc activity từ quá khứ (không giới hạn)");
             }
 
-            if (Config.ACTIVITY_END_DATE != null && !Config.ACTIVITY_END_DATE.isEmpty()) {
-                System.out.println("   - ✂️  CẮT TẠI: " + Config.ACTIVITY_END_DATE + " (không đọc activity sau ngày này)");
+            if (Config.getActivityEndDate() != null && !Config.getActivityEndDate().isEmpty()) {
+                System.out.println("   - ✂️  CẮT TẠI: " + Config.getActivityEndDate() + " (không đọc activity sau ngày này)");
             } else {
                 System.out.println("   - Đọc đến hiện tại (không giới hạn ngày kết thúc)");
             }
@@ -304,14 +314,14 @@ public class Main {
 
 // 🆕 THÊM ĐOẠN NÀY - Hiển thị cấu hình filter
             System.out.println("⚙️  CẤU HÌNH ACTIVITY FILTER:");
-            if (Config.ACTIVITY_DAYS > 0) {
-                System.out.println("   - Đọc activity từ " + Config.ACTIVITY_DAYS + " ngày trước");
+            if (Config.getActivityDays() > 0) {
+                System.out.println("   - Đọc activity từ " + Config.getActivityDays() + " ngày trước");
             } else {
                 System.out.println("   - Đọc activity từ quá khứ (không giới hạn)");
             }
 
-            if (Config.ACTIVITY_END_DATE != null && !Config.ACTIVITY_END_DATE.isEmpty()) {
-                System.out.println("   - ✂️  CẮT TẠI: " + Config.ACTIVITY_END_DATE + " (không đọc activity sau ngày này)");
+            if (Config.getActivityEndDate() != null && !Config.getActivityEndDate().isEmpty()) {
+                System.out.println("   - ✂️  CẮT TẠI: " + Config.getActivityEndDate() + " (không đọc activity sau ngày này)");
             } else {
                 System.out.println("   - Đọc đến hiện tại (không giới hạn ngày kết thúc)");
             }

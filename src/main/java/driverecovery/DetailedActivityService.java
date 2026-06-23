@@ -129,10 +129,10 @@ public class DetailedActivityService {
         List<String> filterParts = new ArrayList<>();
 
         // 1. Filter START time
-        if (Config.ACTIVITY_DAYS > 0) {
+        if (Config.getActivityDays() > 0) {
             try {
                 Calendar cal = Calendar.getInstance();
-                cal.add(Calendar.DATE, -Config.ACTIVITY_DAYS);
+                cal.add(Calendar.DATE, -Config.getActivityDays());
 
                 SimpleDateFormat isoFormat = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'");
                 isoFormat.setTimeZone(TimeZone.getTimeZone("UTC"));
@@ -145,11 +145,11 @@ public class DetailedActivityService {
         }
 
         // 2. ✨ Filter END time
-        if (Config.ACTIVITY_END_DATE != null && !Config.ACTIVITY_END_DATE.isEmpty()) {
+        if (Config.getActivityEndDate() != null && !Config.getActivityEndDate().isEmpty()) {
             try {
                 SimpleDateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd");
                 dateFormat.setTimeZone(TimeZone.getTimeZone("UTC"));
-                Date endDate = dateFormat.parse(Config.ACTIVITY_END_DATE);
+                Date endDate = dateFormat.parse(Config.getActivityEndDate());
 
                 Calendar cal = Calendar.getInstance(TimeZone.getTimeZone("UTC"));
                 cal.setTime(endDate);
@@ -542,12 +542,13 @@ public class DetailedActivityService {
         String fileName = "detailed-activity-" + folderInfo.name.replaceAll("[^a-zA-Z0-9]", "_") +
                 "-" + timestamp + ".xlsx";
 
-        java.io.File outputDir = new java.io.File(Config.OUTPUT_DIRECTORY);
+        // Fix #4: Dùng getOutputDirectory() thay vì static constant OUTPUT_DIRECTORY
+        java.io.File outputDir = new java.io.File(Config.getOutputDirectory());
         if (!outputDir.exists()) {
             outputDir.mkdirs();
         }
 
-        String fullPath = Config.OUTPUT_DIRECTORY + fileName;
+        String fullPath = Config.getOutputDirectory() + fileName;
         Workbook workbook = new XSSFWorkbook();
 
         // ⭐ 5 SHEETS CHI TIẾT
@@ -1361,12 +1362,13 @@ public class DetailedActivityService {
         String timestamp = new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date());
         String fileName = "detailed-activity-" + userEmail.split("@")[0] + "-ALL-FOLDERS-" + timestamp + ".xlsx";
 
-        java.io.File outputDir = new java.io.File(Config.OUTPUT_DIRECTORY);
+        // Fix #4: Dùng getter thay vì static constant
+        java.io.File outputDir = new java.io.File(Config.getOutputDirectory());
         if (!outputDir.exists()) {
             outputDir.mkdirs();
         }
 
-        String fullPath = Config.OUTPUT_DIRECTORY + fileName;
+        String fullPath = Config.getOutputDirectory() + fileName;
         Workbook workbook = new XSSFWorkbook();
 
         // ⭐ SHEET 1: Organization Summary (tổng quan folders)
@@ -2336,12 +2338,13 @@ public class DetailedActivityService {
         String timestamp = new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date());
         String fileName = "detailed-activity-ORGANIZATION-" + timestamp + ".xlsx";
 
-        java.io.File outputDir = new java.io.File(Config.OUTPUT_DIRECTORY);
+        // Fix #4: Dùng getter thay vì static constant
+        java.io.File outputDir = new java.io.File(Config.getOutputDirectory());
         if (!outputDir.exists()) {
             outputDir.mkdirs();
         }
 
-        String fullPath = Config.OUTPUT_DIRECTORY + fileName;
+        String fullPath = Config.getOutputDirectory() + fileName;
         Workbook workbook = new XSSFWorkbook();
 
         // ⭐ SHEET 1: Organization Summary
