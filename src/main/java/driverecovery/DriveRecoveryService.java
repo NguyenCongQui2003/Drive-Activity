@@ -34,6 +34,10 @@ public class DriveRecoveryService {
     // Flag đánh dấu nếu bị timeout → tên file Excel sẽ có prefix "Timeout-"
     private volatile boolean timedOut = false;
 
+    // ⭐ FIX 429: Semaphore đảm bảo chỉ 1 thread gọi Activity API tại một thời điểm.
+    // Activity API quota là "per user per minute" → 3 threads cùng gọi = 3x quota consumption.
+    private final java.util.concurrent.Semaphore activityApiSemaphore = new java.util.concurrent.Semaphore(1);
+
     public DriveRecoveryService(Drive driveService, DriveActivity activityService) {
         this.driveService = driveService;
         this.activityService = activityService;
@@ -1150,8 +1154,9 @@ public class DriveRecoveryService {
                 req.setFilter(folderFilter);
             }
 
+            // ⭐ FIX 429: dùng helper có semaphore + retry
             com.google.api.services.driveactivity.v2.model.QueryDriveActivityResponse resp =
-                    activityService.activity().query(req).execute();
+                    executeActivityQueryWithRetry(req);
 
             if (resp.getActivities() != null) {
                 for (com.google.api.services.driveactivity.v2.model.DriveActivity activity : resp.getActivities()) {
@@ -1164,6 +1169,59 @@ public class DriveRecoveryService {
         return map.values().stream()
                 .filter(fh -> fh.everInFolder)
                 .collect(java.util.stream.Collectors.toList());
+    }
+
+    /**
+     * ⭐ FIX 429: Gọi Activity API với:
+     *  1. Semaphore (1 permit) → chỉ 1 thread gọi tại một lúc (quota là per-user per-minute)
+     *  2. Exponential backoff retry tối đa 5 lần khi gặp RATE_LIMIT_EXCEEDED (429)
+     */
+    private com.google.api.services.driveactivity.v2.model.QueryDriveActivityResponse
+    executeActivityQueryWithRetry(
+            com.google.api.services.driveactivity.v2.model.QueryDriveActivityRequest req)
+            throws IOException {
+
+        int maxRetries = 5;
+        long baseDelayMs = 2000; // 2 giây backoff cơ bản
+
+        for (int attempt = 0; attempt <= maxRetries; attempt++) {
+            // Acquire semaphore → chỉ 1 thread vào được
+            try {
+                activityApiSemaphore.acquire();
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrupted while waiting for Activity API slot", ie);
+            }
+
+            try {
+                com.google.api.services.driveactivity.v2.model.QueryDriveActivityResponse resp =
+                        activityService.activity().query(req).execute();
+                // Thêm delay nhỏ giữa các call để tránh burst (300ms)
+                try { Thread.sleep(300); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+                return resp;
+
+            } catch (com.google.api.client.googleapis.json.GoogleJsonResponseException e) {
+                if (e.getStatusCode() == 429) {
+                    long waitMs = baseDelayMs * (1L << attempt); // 2s, 4s, 8s, 16s, 32s
+                    ProgressTracker.getInstance().log(
+                            "  ⏳ Activity API 429 (attempt " + (attempt + 1) + "/" + maxRetries + ")" +
+                            " — chờ " + (waitMs / 1000) + "s rồi retry...",
+                            ProgressTracker.LogLevel.WARNING);
+                    if (attempt < maxRetries) {
+                        try { Thread.sleep(waitMs); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+                    } else {
+                        throw e; // Hết retry → ném lỗi
+                    }
+                } else {
+                    throw e; // Lỗi khác (404, 403...) → ném ngay
+                }
+            } finally {
+                activityApiSemaphore.release(); // Luôn release dù thành công hay fail
+            }
+        }
+
+        // Should never reach here
+        throw new IOException("Activity API retry exhausted");
     }
 
     private Drive createDriveServiceForUserWithRetry(String userEmail) throws Exception {
@@ -1312,9 +1370,8 @@ public class DriveRecoveryService {
                 request.setPageToken(pageToken);
             }
 
-            QueryDriveActivityResponse response = activityService.activity()
-                    .query(request)
-                    .execute();
+            // ⭐ FIX 429: dùng helper có semaphore + retry
+            QueryDriveActivityResponse response = executeActivityQueryWithRetry(request);
 
             if (response.getActivities() != null) {
                 List<com.google.api.services.driveactivity.v2.model.DriveActivity> activities = new ArrayList<>(
