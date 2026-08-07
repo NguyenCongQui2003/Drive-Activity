@@ -75,8 +75,9 @@ public class RunPanel extends JPanel implements ProgressTracker.ProgressListener
     private SimpleAttributeSet sty(Color c, boolean bold) {
         var s = new SimpleAttributeSet();
         StyleConstants.setForeground(s, c);
+        // F_MONO.getFamily() = Segoe UI → hỗ trợ tiếng Việt + emoji đầy đủ
         StyleConstants.setFontFamily(s, F_MONO.getFamily());
-        StyleConstants.setFontSize(s, 12);
+        StyleConstants.setFontSize(s, 13);
         StyleConstants.setBold(s, bold);
         return s;
     }
@@ -372,7 +373,7 @@ public class RunPanel extends JPanel implements ProgressTracker.ProgressListener
         logPane.setEditable(false);
         logPane.setBackground(new Color(0x0D1117));
         logPane.setForeground(C_TEXT);
-        logPane.setFont(new Font(F_MONO.getFamily(), Font.PLAIN, 12));
+        logPane.setFont(new Font(F_MONO.getFamily(), Font.PLAIN, 13));
         logPane.setCaretColor(C_ACCENT);
         logPane.setBorder(BorderFactory.createEmptyBorder(8, 12, 8, 12));
         logDoc = logPane.getStyledDocument();
@@ -453,7 +454,7 @@ public class RunPanel extends JPanel implements ProgressTracker.ProgressListener
                 SimpleAttributeSet tsStyle = new SimpleAttributeSet();
                 StyleConstants.setForeground(tsStyle, C_TEXT3);
                 StyleConstants.setFontFamily(tsStyle, F_MONO.getFamily());
-                StyleConstants.setFontSize(tsStyle, 11);
+                StyleConstants.setFontSize(tsStyle, 12);
                 logDoc.insertString(logDoc.getLength(), "[" + ts + "] ", tsStyle);
                 logDoc.insertString(logDoc.getLength(), msg + "\n", style);
                 logPane.setCaretPosition(logDoc.getLength());

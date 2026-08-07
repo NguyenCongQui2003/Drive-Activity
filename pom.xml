@@ -31,11 +31,18 @@
             <version>v2-rev20230704-2.0.0</version>
         </dependency>
 
-        <!-- Google Admin SDK -->
+        <!-- Google Admin SDK Directory -->
         <dependency>
             <groupId>com.google.apis</groupId>
             <artifactId>google-api-services-admin-directory</artifactId>
             <version>directory_v1-rev20220919-2.0.0</version>
+        </dependency>
+
+        <!-- Google Admin SDK Reports API (tìm owner file/folder qua audit log) -->
+        <dependency>
+            <groupId>com.google.apis</groupId>
+            <artifactId>google-api-services-admin-reports</artifactId>
+            <version>reports_v1-rev20250128-2.0.0</version>
         </dependency>
 
         <!-- Google API Client -->
@@ -110,6 +117,7 @@
                     <source>21</source>
                     <target>21</target>
                     <release>21</release>
+                    <encoding>UTF-8</encoding>
                 </configuration>
             </plugin>
 

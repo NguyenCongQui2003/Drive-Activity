@@ -453,8 +453,75 @@ public class UserListPanel extends JPanel {
         return r;
     }
 
-    public List<String> getAllUsersForSearch() { return allForSearch.isEmpty() ? getSelectedUsers() : allForSearch; }
+    /**
+     * Trả về danh sách user dùng để tìm kiếm file/folder bị thiếu.
+     * Luôn trả về toàn bộ user từ mọi nguồn (không phụ thuộc tab đang chọn):
+     *  - Ưu tiên allForSearch (đã fetch từ Admin SDK = toàn tổ chức)
+     *  - Fallback: gom từ tất cả tab (SDK table + CSV table + Manual)
+     */
+    public List<String> getAllUsersForSearch() {
+        // Nếu đã fetch Admin SDK → dùng danh sách toàn tổ chức
+        if (!allForSearch.isEmpty()) return new ArrayList<>(allForSearch);
+        // Chưa fetch SDK → gom hết từ mọi tab (kể cả không tích)
+        return getAllLoadedUsers();
+    }
     public void setConfigSupplier(Supplier<AppConfig> s) { cfgSupplier = s; }
+
+    /** Kiểm tra đã có danh sách toàn tổ chức (từ Admin SDK) chưa */
+    public boolean isAllForSearchReady() { return !allForSearch.isEmpty(); }
+
+    /**
+     * Tự động fetch toàn bộ user từ Admin SDK ở background.
+     * Dùng khi nhấn Chạy mà chưa fetch SDK.
+     * @param onDone callback(true) = thành công, callback(false) = lỗi hoặc không đủ config
+     * @param onLog  callback để ghi log ra RunPanel
+     */
+    public void fetchUsersForRun(java.util.function.Consumer<Boolean> onDone,
+                                  java.util.function.Consumer<String>  onLog) {
+        if (cfgSupplier == null) { onDone.accept(false); return; }
+        AppConfig cfg = cfgSupplier.get();
+        if (cfg.adminEmail.isBlank() || cfg.serviceAccountJsonPath.isBlank()) {
+            // Không đủ config để fetch → tiếp tục với danh sách hiện có
+            onDone.accept(false);
+            return;
+        }
+        onLog.accept("⏳  Đang tự động tải danh sách toàn bộ user từ Admin SDK...");
+        // Cập nhật trạng thái nút Fetch trên UI
+        SwingUtilities.invokeLater(() -> {
+            btnFetch.setEnabled(false);
+            sdkBar.setVisible(true);
+            lblSdkCount.setText("Đang tải...");
+        });
+        new SwingWorker<List<String[]>, Void>() {
+            @Override protected List<String[]> doInBackground() throws Exception { return doFetch(cfg); }
+            @Override protected void done() {
+                SwingUtilities.invokeLater(() -> { sdkBar.setVisible(false); btnFetch.setEnabled(true); });
+                try {
+                    List<String[]> list = get();
+                    allForSearch.clear();
+                    SwingUtilities.invokeLater(() -> sdkModel.setRowCount(0));
+                    for (String[] u : list) {
+                        final String[] fu = u;
+                        SwingUtilities.invokeLater(() -> sdkModel.addRow(new Object[]{true, fu[0], fu[1]}));
+                        allForSearch.add(u[0]);
+                    }
+                    SwingUtilities.invokeLater(() -> {
+                        lblSdkCount.setText(list.size() + " người dùng");
+                        refreshCount();
+                    });
+                    onLog.accept("✅  Đã tải " + list.size() + " user từ Admin SDK. Tiếp tục chạy...");
+                    onDone.accept(true);
+                } catch (Exception e) {
+                    String msg = e.getMessage();
+                    if (msg == null) msg = e.getClass().getSimpleName();
+                    onLog.accept("⚠️  Không thể tải Admin SDK: " + msg + " — Tiếp tục với danh sách CSV.");
+                    SwingUtilities.invokeLater(() -> lblSdkCount.setText("Lỗi!"));
+                    onDone.accept(false);
+                }
+            }
+        }.execute();
+    }
+
 
     /** Trả về TẤT CẢ email đang có trong mọi tab (kể cả không tích) — dùng cho Mode 2 search list */
     public List<String> getAllLoadedUsers() {

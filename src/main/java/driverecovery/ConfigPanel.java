@@ -47,11 +47,17 @@ public class ConfigPanel extends JPanel {
         Set<String> av = new HashSet<>(Arrays.asList(ge.getAvailableFontFamilyNames()));
         String ui   = av.contains("Segoe UI")   ? "Segoe UI"   : av.contains("Tahoma") ? "Tahoma" : "Dialog";
         String mono = av.contains("Consolas")    ? "Consolas"   : av.contains("Courier New") ? "Courier New" : "Monospaced";
+        // Font UI chuẩn
         F_TITLE = new Font(ui,   Font.BOLD,  15);
         F_LABEL = new Font(ui,   Font.PLAIN, 13);
         F_INPUT = new Font(mono, Font.PLAIN, 13);
         F_SMALL = new Font(ui,   Font.PLAIN, 12);
-        F_MONO  = new Font(mono, Font.PLAIN, 13);
+        // F_MONO dùng cho log — ưu tiên Segoe UI (hỗ trợ tiếng Việt + emoji đầy đủ)
+        // Consolas không hỗ trợ nhiều ký tự Unicode mở rộng → bị hiện ký tự lạ
+        String logFont = av.contains("Segoe UI") ? "Segoe UI"
+                       : av.contains("Tahoma")   ? "Tahoma"
+                       : "Dialog";
+        F_MONO  = new Font(logFont, Font.PLAIN, 13);
     }
 
     private JTextField tfJsonPath;
@@ -189,6 +195,7 @@ public class ConfigPanel extends JPanel {
             }
         };
         drop.setOpaque(false);
+        drop.setAlignmentX(LEFT_ALIGNMENT);
         drop.setBorder(BorderFactory.createEmptyBorder(12,16,12,12));
         drop.setMaximumSize(new Dimension(Integer.MAX_VALUE, 52));
 
@@ -220,47 +227,12 @@ public class ConfigPanel extends JPanel {
         lblEmail   = mkInfoLbl("", C_TEXT2);
         lblProject = mkInfoLbl("", C_TEXT2);
 
-        // ── Info panel (no emoji — use reliable Unicode only)
-        JPanel infoBox = new JPanel() {
-            @Override protected void paintComponent(Graphics g) {
-                Graphics2D g2 = (Graphics2D) g.create();
-                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-                g2.setColor(C_BG0);
-                g2.fillRoundRect(0,0,getWidth()-1,getHeight()-1,10,10);
-                g2.setColor(new Color(C_BORDER.getRed(), C_BORDER.getGreen(), C_BORDER.getBlue(), 160));
-                g2.drawRoundRect(0,0,getWidth()-1,getHeight()-1,10,10);
-                // yellow top highlight
-                g2.setColor(new Color(C_YELLOW.getRed(), C_YELLOW.getGreen(), C_YELLOW.getBlue(), 160));
-                g2.setStroke(new BasicStroke(2f));
-                g2.drawLine(14,0,getWidth()-14,0);
-                g2.dispose();
-            }
-        };
-        infoBox.setOpaque(false);
-        infoBox.setLayout(new BoxLayout(infoBox, BoxLayout.Y_AXIS));
-        infoBox.setBorder(BorderFactory.createEmptyBorder(10,14,10,12));
-        infoBox.setMaximumSize(new Dimension(Integer.MAX_VALUE, 120));
-        infoBox.setAlignmentX(LEFT_ALIGNMENT);
-
-        // Status dot that updates colour on load
-        JLabel statusDot = new JLabel("\u25CF");
-        statusDot.setForeground(C_TEXT3);
-        statusDot.setFont(new Font(F_SMALL.getFamily(), Font.PLAIN, 14));
-        lblStatus.addPropertyChangeListener("text", evt -> {
-            String t = lblStatus.getText();
-            if (t.startsWith("\u0110\u00e3 t\u1ea3i")) { statusDot.setForeground(C_GREEN);  lblEmail.setForeground(C_GREEN); }
-            else if (t.startsWith("L\u1ed7i"))         { statusDot.setForeground(C_RED);    lblEmail.setForeground(C_RED); }
-            else                                       { statusDot.setForeground(C_TEXT3); lblEmail.setForeground(C_TEXT2); }
-        });
-
-        infoBox.add(mkInfoRow(statusDot, lblStatus));
-        infoBox.add(vgap(5));
-        infoBox.add(mkInfoRow(mkPfx("@"), lblEmail));
-        infoBox.add(vgap(5));
-        infoBox.add(mkInfoRow(mkPfx("#"), lblProject));
+        // ── Admin email input
+        tfAdminEmail = mkInput();
+        tfAdminEmail.setText(Config.getAdminEmail());
+        tfAdminEmail.setToolTipText("Email của Admin trong Google Workspace dùng để impersonate");
 
         // ── Scopes panel ─────────────────────────────────────
-        String scopeText = String.join(",\n", Config.SCOPES);
         JPanel scopeBox = new JPanel() {
             @Override protected void paintComponent(Graphics g) {
                 Graphics2D g2 = (Graphics2D) g.create();
@@ -269,7 +241,6 @@ public class ConfigPanel extends JPanel {
                 g2.fillRoundRect(0,0,getWidth()-1,getHeight()-1,10,10);
                 g2.setColor(new Color(C_ACCENT.getRed(),C_ACCENT.getGreen(),C_ACCENT.getBlue(),80));
                 g2.drawRoundRect(0,0,getWidth()-1,getHeight()-1,10,10);
-                // blue top accent
                 g2.setColor(new Color(C_ACCENT.getRed(),C_ACCENT.getGreen(),C_ACCENT.getBlue(),180));
                 g2.setStroke(new BasicStroke(2f));
                 g2.drawLine(14,0,getWidth()-14,0);
@@ -279,8 +250,8 @@ public class ConfigPanel extends JPanel {
         scopeBox.setOpaque(false);
         scopeBox.setLayout(new BorderLayout(6, 0));
         scopeBox.setBorder(BorderFactory.createEmptyBorder(10,14,10,10));
-        // No maxHeight — let the content breathe
         scopeBox.setAlignmentX(LEFT_ALIGNMENT);
+        scopeBox.setMaximumSize(new Dimension(Integer.MAX_VALUE, Integer.MAX_VALUE));
 
         JPanel scopeLeft = new JPanel();
         scopeLeft.setLayout(new BoxLayout(scopeLeft, BoxLayout.Y_AXIS));
@@ -290,9 +261,8 @@ public class ConfigPanel extends JPanel {
         scopeTitle.setForeground(C_ACCENT);
         scopeTitle.setFont(new Font(F_SMALL.getFamily(), Font.BOLD, 11));
         scopeLeft.add(scopeTitle);
-        scopeLeft.add(vgap(5));
+        scopeLeft.add(vgap(4));
         for (String s : Config.SCOPES) {
-            // Shorten label: show only the last path segment
             String shortName = s.contains("/") ? "..." + s.substring(s.lastIndexOf('/')) : s;
             JLabel sl = new JLabel(shortName);
             sl.setForeground(C_TEXT2);
@@ -340,20 +310,92 @@ public class ConfigPanel extends JPanel {
         scopeBox.add(scopeLeft, BorderLayout.CENTER);
         scopeBox.add(btnCopy, BorderLayout.EAST);
 
-        // ── Admin email input
-        tfAdminEmail = mkInput();
-        tfAdminEmail.setText(Config.getAdminEmail());
-        tfAdminEmail.setToolTipText("Email của Admin trong Google Workspace dùng để impersonate");
+        // ── "Kiểm tra kết nối" button
+        JLabel lblConnStatus = new JLabel("");
+        lblConnStatus.setFont(new Font(F_SMALL.getFamily(), Font.PLAIN, 11));
+        lblConnStatus.setForeground(C_TEXT3);
+        lblConnStatus.setAlignmentX(LEFT_ALIGNMENT);
 
+        JButton btnTest = new JButton("\uD83D\uDD12  Ki\u1ec3m tra k\u1ebft n\u1ed1i") {
+            boolean hover = false;
+            { addMouseListener(new MouseAdapter() {
+                public void mouseEntered(MouseEvent e) { hover=true;  repaint(); }
+                public void mouseExited (MouseEvent e) { hover=false; repaint(); }
+            }); }
+            @Override protected void paintComponent(Graphics g) {
+                Graphics2D g2 = (Graphics2D) g.create();
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                Color base = new Color(0x1F6FEB);
+                g2.setColor(hover
+                    ? new Color(base.getRed(), base.getGreen(), base.getBlue(), 220)
+                    : new Color(base.getRed(), base.getGreen(), base.getBlue(), 180));
+                g2.fillRoundRect(0, 0, getWidth(), getHeight(), 10, 10);
+                g2.setColor(hover ? C_ACCENT2 : C_ACCENT);
+                g2.setStroke(new BasicStroke(1f));
+                g2.drawRoundRect(0, 0, getWidth()-1, getHeight()-1, 10, 10);
+                g2.dispose(); super.paintComponent(g);
+            }
+        };
+        btnTest.setForeground(Color.WHITE);
+        btnTest.setFont(new Font(F_LABEL.getFamily(), Font.BOLD, 12));
+        btnTest.setFocusPainted(false); btnTest.setBorderPainted(false); btnTest.setContentAreaFilled(false);
+        btnTest.setBorder(BorderFactory.createEmptyBorder(7, 18, 7, 18));
+        btnTest.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        btnTest.setAlignmentX(LEFT_ALIGNMENT);
+        btnTest.setMaximumSize(new Dimension(Integer.MAX_VALUE, 36));
+        btnTest.addActionListener(e -> {
+            String jsonPath  = tfJsonPath.getText().trim();
+            String adminMail = tfAdminEmail.getText().trim();
+            if (jsonPath.isBlank()) {
+                lblConnStatus.setText("\u26A0 Ch\u01b0a ch\u1ecdn file JSON!");
+                lblConnStatus.setForeground(C_YELLOW);
+                return;
+            }
+            if (adminMail.isBlank() || !adminMail.contains("@")) {
+                lblConnStatus.setText("\u26A0 Ch\u01b0a nh\u1eadp email admin h\u1ee3p l\u1ec7!");
+                lblConnStatus.setForeground(C_YELLOW);
+                return;
+            }
+            lblConnStatus.setText("\u23F3 \u0110ang ki\u1ec3m tra...");
+            lblConnStatus.setForeground(C_TEXT3);
+            btnTest.setEnabled(false);
+            new Thread(() -> {
+                String result;
+                Color  color;
+                try {
+                    com.google.auth.oauth2.GoogleCredentials creds =
+                        com.google.auth.oauth2.ServiceAccountCredentials
+                            .fromStream(new java.io.FileInputStream(jsonPath))
+                            .createScoped(Config.SCOPES)
+                            .createDelegated(adminMail);
+                    // Trigger token fetch — throws if credentials/scope/impersonation invalid
+                    creds.refresh();
+                    result = "\u2705 K\u1ebft n\u1ed1i th\u00e0nh c\u00f4ng!"; color = C_GREEN;
+                } catch (Exception ex) {
+                    String msg = ex.getMessage();
+                    if (msg == null) msg = ex.getClass().getSimpleName();
+                    if (msg.length() > 80) msg = msg.substring(0, 80) + "...";
+                    result = "\u274C L\u1ed7i: " + msg; color = C_RED;
+                }
+                final String fr = result; final Color fc = color;
+                SwingUtilities.invokeLater(() -> {
+                    lblConnStatus.setText(fr);
+                    lblConnStatus.setForeground(fc);
+                    btnTest.setEnabled(true);
+                });
+            }, "conn-test").start();
+        });
+
+        // ── Assemble section — clean, top-to-bottom consistent order
         sec.add(drop);
-        sec.add(vgap(8));
-        sec.add(mkField("\u0110\u01b0\u1eddng d\u1eabn t\u1ec7p", tfJsonPath));
-        sec.add(vgap(10));
-        sec.add(infoBox);
         sec.add(vgap(10));
         sec.add(mkField("Email Admin (Workspace)", tfAdminEmail));
         sec.add(vgap(10));
-        sec.add(scopeBox);
+        sec.add(mkField("Scopes API", scopeBox));
+        sec.add(vgap(12));
+        sec.add(btnTest);
+        sec.add(vgap(6));
+        sec.add(lblConnStatus);
         return sec;
     }
 
@@ -938,6 +980,7 @@ public class ConfigPanel extends JPanel {
         cb.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
         return cb;
     }
+
 
     private JLabel mkInfoLbl(String text, Color c) {
         JLabel l = new JLabel(text);

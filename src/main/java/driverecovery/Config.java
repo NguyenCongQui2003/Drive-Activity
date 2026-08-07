@@ -57,7 +57,8 @@ public class Config {
     public static final List<String> SCOPES = Arrays.asList(
             "https://www.googleapis.com/auth/drive",
             "https://www.googleapis.com/auth/drive.activity.readonly",
-            "https://www.googleapis.com/auth/admin.directory.user.readonly"
+            "https://www.googleapis.com/auth/admin.directory.user.readonly",
+            "https://www.googleapis.com/auth/admin.reports.audit.readonly"
     );
 
 

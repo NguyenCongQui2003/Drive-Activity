@@ -77,15 +77,18 @@ public class DriveRecoveryService {
 
                 } catch (Exception e) {
                     errorCount.incrementAndGet();
-
+                    String errMsg = (e instanceof com.google.api.client.googleapis.json.GoogleJsonResponseException gje)
+                            ? "HTTP " + gje.getStatusCode() + ": " + (gje.getDetails() != null ? gje.getDetails().getMessage() : gje.getMessage())
+                            : e.getClass().getSimpleName() + ": " + e.getMessage();
                     synchronized (System.err) {
-                        System.err.println("  ❌ Lỗi tại " + folder.path + ": " + e.getMessage());
+                        System.err.println("  ❌ Lỗi tại " + folder.path + ": " + errMsg);
                     }
+                    ProgressTracker.getInstance().log("  ❌ Lỗi folder: " + errMsg, ProgressTracker.LogLevel.ERROR);
 
                     FolderReport errorReport = new FolderReport();
                     errorReport.folderPath = folder.path;
                     errorReport.folderId = folder.id;
-                    errorReport.error = e.getMessage();
+                    errorReport.error = errMsg;
                     allReports.add(errorReport);
                 }
             });
@@ -96,11 +99,11 @@ public class DriveRecoveryService {
         try {
             System.out.println("\n⏳ Đang đợi tất cả threads hoàn thành...");
 
-            boolean finished = executor.awaitTermination(8, java.util.concurrent.TimeUnit.HOURS);
+            boolean finished = executor.awaitTermination(24, java.util.concurrent.TimeUnit.HOURS);
 
             if (!finished) {
                 String timeoutMsg = String.format(
-                    "⚠️  TIMEOUT! User [%s] chưa hoàn thành sau 8 giờ. Đã xử lý: %d/%d folder (%.1f%%)",
+                    "⚠️  TIMEOUT! User [%s] chưa hoàn thành sau 24 giờ. Đã xử lý: %d/%d folder (%.1f%%)",
                     userEmail, processedCount.get(), allFolders.size(),
                     allFolders.size() > 0 ? processedCount.get() * 100.0 / allFolders.size() : 0);
                 System.err.println(timeoutMsg);
@@ -188,15 +191,18 @@ public class DriveRecoveryService {
 
                 } catch (Exception e) {
                     errorCount.incrementAndGet();
-
+                    String errMsg = (e instanceof com.google.api.client.googleapis.json.GoogleJsonResponseException gje)
+                            ? "HTTP " + gje.getStatusCode() + ": " + (gje.getDetails() != null ? gje.getDetails().getMessage() : gje.getMessage())
+                            : e.getClass().getSimpleName() + ": " + e.getMessage();
                     synchronized (System.err) {
-                        System.err.println("  ❌ Lỗi tại " + folder.path + ": " + e.getMessage());
+                        System.err.println("  ❌ Lỗi tại " + folder.path + ": " + errMsg);
                     }
+                    ProgressTracker.getInstance().log("  ❌ Lỗi folder: " + errMsg, ProgressTracker.LogLevel.ERROR);
 
                     FolderReport errorReport = new FolderReport();
                     errorReport.folderPath = folder.path;
                     errorReport.folderId   = folder.id;
-                    errorReport.error      = e.getMessage();
+                    errorReport.error      = errMsg;
                     allReports.add(errorReport);
                 }
             });
@@ -207,11 +213,11 @@ public class DriveRecoveryService {
         try {
             System.out.println("\n⏳ Đang đợi tất cả threads hoàn thành...");
 
-            boolean finished = executor.awaitTermination(8, java.util.concurrent.TimeUnit.HOURS);
+            boolean finished = executor.awaitTermination(24, java.util.concurrent.TimeUnit.HOURS);
 
             if (!finished) {
                 String timeoutMsg = String.format(
-                    "⚠️  TIMEOUT! Folder [%s] của user [%s] chưa hoàn thành sau 8 giờ. Đã xử lý: %d/%d folder (%.1f%%)",
+                    "⚠️  TIMEOUT! Folder [%s] của user [%s] chưa hoàn thành sau 24 giờ. Đã xử lý: %d/%d folder (%.1f%%)",
                     folderId, userEmail, processedCount.get(), allFolders.size(),
                     allFolders.size() > 0 ? processedCount.get() * 100.0 / allFolders.size() : 0);
                 System.err.println(timeoutMsg);
@@ -610,69 +616,43 @@ public class DriveRecoveryService {
 
         ProgressTracker pt = ProgressTracker.getInstance();
 
-        // Bước 1: Thử tìm trong current user's Drive trước
+        // ── Vòng 1: Tìm trong Drive của user hiện tại ─────────────────────────
         File fileLocation = findFileById(file.id);
         if (fileLocation != null) {
             pt.log("    ✓ Tìm thấy file trong Drive của " + userEmail, ProgressTracker.LogLevel.INFO);
             return handleFoundFile(file.id, fileLocation, userEmail, targetFolderId, targetFolderPath, subfolderIds, result, null);
         }
 
-        // Bước 2: Admin lookup
+        // ── Vòng 2: Reports API → tìm owner qua audit log toàn tổ chức ───────
+        // Giống Admin Console: tra cứu file ID trong Drive log events để biết owner là ai
         String adminEmail = Config.getAdminEmail();
-        if (adminEmail != null && !adminEmail.isBlank() && !adminEmail.equals(userEmail)) {
-            pt.log("    🔍 Thử admin: " + adminEmail, ProgressTracker.LogLevel.DETAIL);
-            try {
-                Drive adminDrive = createDriveServiceForUserWithRetry(adminEmail);
-                fileLocation = adminDrive.files().get(file.id)
-                        .setFields("id, name, parents, trashed, mimeType, owners, driveId")
-                        .setSupportsAllDrives(true)
-                        .execute();
-                pt.log("    ✓ Tìm thấy qua admin: " + fileLocation.getName(), ProgressTracker.LogLevel.INFO);
-                return handleFoundFile(file.id, fileLocation, userEmail, targetFolderId, targetFolderPath, subfolderIds, result, adminEmail);
-            } catch (com.google.api.client.googleapis.json.GoogleJsonResponseException e) {
-                pt.log("    ⚠️  Admin không thấy (" + e.getStatusCode() + ") → quét từng user...", ProgressTracker.LogLevel.DETAIL);
-            } catch (Exception e) {
-                pt.log("    ⚠️  Lỗi admin: " + e.getMessage(), ProgressTracker.LogLevel.DETAIL);
-            }
-        }
-
-        // Bước 3: Quét từng user trong allUsersForSearch
-        java.util.List<String> searchUsers = Config.getAllUsersForSearch();
-        // ⭐ FIX: Nếu allUsersForSearch rỗng, fallback dùng selectedUsers + adminEmail
-        if (searchUsers == null || searchUsers.isEmpty()) {
-            searchUsers = new java.util.ArrayList<>(Config.getUsersToCheck());
-            if (adminEmail != null && !adminEmail.isBlank() && !searchUsers.contains(adminEmail)) {
-                searchUsers.add(adminEmail);
-            }
-            if (!searchUsers.isEmpty()) {
-                pt.log("    ℹ️  allUsersForSearch rỗng → fallback quét " + searchUsers.size() + " user từ danh sách chọn", ProgressTracker.LogLevel.DETAIL);
-            }
-        }
-        if (searchUsers != null && !searchUsers.isEmpty()) {
-            pt.log("    🔍 Quét " + searchUsers.size() + " users tìm file...", ProgressTracker.LogLevel.DETAIL);
-            for (String candidate : searchUsers) {
-                if (candidate.equals(userEmail)) continue;
-                if (candidate.equals(adminEmail)) continue;
+        pt.log("    🔍 Vòng 1 không thấy → hỏi Reports API tìm owner của file ID: " + file.id, ProgressTracker.LogLevel.DETAIL);
+        String ownerEmail = findOwnerViaReportsApi(file.id, adminEmail);
+        if (ownerEmail != null && !ownerEmail.isBlank()) {
+            pt.log("    📋 Reports API → owner: " + ownerEmail, ProgressTracker.LogLevel.INFO);
+            if (!ownerEmail.equals(userEmail)) {
                 try {
-                    Drive candidateDrive = createDriveServiceForUserWithRetry(candidate);
-                    fileLocation = candidateDrive.files().get(file.id)
+                    Drive ownerDrive = createDriveServiceForUserWithRetry(ownerEmail);
+                    fileLocation = ownerDrive.files().get(file.id)
                             .setFields("id, name, parents, trashed, mimeType, owners, driveId")
                             .setSupportsAllDrives(true)
                             .execute();
-                    pt.log("    ✓ Tìm thấy tại Drive của: " + candidate + " → " + fileLocation.getName(), ProgressTracker.LogLevel.SUCCESS);
-                    return handleFoundFile(file.id, fileLocation, userEmail, targetFolderId, targetFolderPath, subfolderIds, result, candidate);
+                    pt.log("    ✅ Tìm thấy qua owner (" + ownerEmail + "): " + fileLocation.getName(), ProgressTracker.LogLevel.SUCCESS);
+                    return handleFoundFile(file.id, fileLocation, userEmail, targetFolderId, targetFolderPath, subfolderIds, result, ownerEmail);
                 } catch (com.google.api.client.googleapis.json.GoogleJsonResponseException e) {
-                    if (e.getStatusCode() == 404) continue;
-                    pt.log("    ⚠️  " + candidate + " lỗi " + e.getStatusCode(), ProgressTracker.LogLevel.DETAIL);
+                    pt.log("    ⚠️  Owner " + ownerEmail + " không truy cập được (" + e.getStatusCode() + ")", ProgressTracker.LogLevel.WARNING);
                 } catch (Exception e) {
-                    pt.log("    ⚠️  " + candidate + ": " + e.getMessage(), ProgressTracker.LogLevel.DETAIL);
+                    pt.log("    ⚠️  Lỗi khi truy cập Drive của owner " + ownerEmail + ": " + e.getMessage(), ProgressTracker.LogLevel.WARNING);
                 }
+            } else {
+                pt.log("    ℹ️  Owner trùng với user hiện tại → file đã bị xóa khỏi Drive", ProgressTracker.LogLevel.DETAIL);
             }
+        } else {
+            pt.log("    ⚠️  Reports API không có log cho file này → không xác định được owner", ProgressTracker.LogLevel.WARNING);
         }
 
-        result.reason = "Không tìm thấy file trong toàn tổ chức";
+        result.reason = "Không tìm thấy file (Reports API: " + (ownerEmail != null ? "owner=" + ownerEmail + " nhưng không truy cập được" : "không có log") + ")";
         result.movedFrom = "-";
-        pt.log("    ❌ Đã quét " + (searchUsers != null ? searchUsers.size() : 0) + " users, không tìm thấy file", ProgressTracker.LogLevel.WARNING);
         return result;
     }
 
@@ -829,69 +809,43 @@ public class DriveRecoveryService {
             return result;
         }
 
-        // Bước 1: Thử tìm trong current user's Drive trước
+        // ── Vòng 1: Tìm trong Drive của user hiện tại ─────────────────────────
         File foundFolder = findFolderById(folderHistory.id, driveService);
         if (foundFolder != null) {
             pt.log("    ✓ Tìm thấy folder trong Drive của " + userEmail, ProgressTracker.LogLevel.INFO);
             return handleFoundFolder(folderHistory.id, foundFolder, userEmail, targetFolderId, targetFolderPath, result, null);
         }
 
-        // Bước 2: Admin lookup
+        // ── Vòng 2: Reports API → tìm owner qua audit log toàn tổ chức ───────
+        // Giống Admin Console: tra cứu folder ID trong Drive log events để biết owner là ai
         String adminEmail = Config.getAdminEmail();
-        if (adminEmail != null && !adminEmail.isBlank() && !adminEmail.equals(userEmail)) {
-            pt.log("    🔍 Thử admin: " + adminEmail, ProgressTracker.LogLevel.DETAIL);
-            try {
-                Drive adminDrive = createDriveServiceForUserWithRetry(adminEmail);
-                foundFolder = adminDrive.files().get(folderHistory.id)
-                        .setFields("id, name, parents, trashed, mimeType, owners, driveId")
-                        .setSupportsAllDrives(true)
-                        .execute();
-                pt.log("    ✓ Tìm thấy qua admin: " + foundFolder.getName(), ProgressTracker.LogLevel.INFO);
-                return handleFoundFolder(folderHistory.id, foundFolder, userEmail, targetFolderId, targetFolderPath, result, adminEmail);
-            } catch (com.google.api.client.googleapis.json.GoogleJsonResponseException e) {
-                pt.log("    ⚠️  Admin không thấy (" + e.getStatusCode() + ") → quét từng user...", ProgressTracker.LogLevel.DETAIL);
-            } catch (Exception e) {
-                pt.log("    ⚠️  Lỗi admin: " + e.getMessage(), ProgressTracker.LogLevel.DETAIL);
-            }
-        }
-
-        // Bước 3: Quét từng user trong allUsersForSearch
-        java.util.List<String> searchUsers = Config.getAllUsersForSearch();
-        // ⭐ FIX: Nếu allUsersForSearch rỗng, fallback dùng selectedUsers + adminEmail
-        if (searchUsers == null || searchUsers.isEmpty()) {
-            searchUsers = new java.util.ArrayList<>(Config.getUsersToCheck());
-            if (adminEmail != null && !adminEmail.isBlank() && !searchUsers.contains(adminEmail)) {
-                searchUsers.add(adminEmail);
-            }
-            if (!searchUsers.isEmpty()) {
-                pt.log("    ℹ️  allUsersForSearch rỗng → fallback quét " + searchUsers.size() + " user từ danh sách chọn", ProgressTracker.LogLevel.DETAIL);
-            }
-        }
-        if (searchUsers != null && !searchUsers.isEmpty()) {
-            pt.log("    🔍 Quét " + searchUsers.size() + " users tìm folder...", ProgressTracker.LogLevel.DETAIL);
-            for (String candidate : searchUsers) {
-                if (candidate.equals(userEmail)) continue;
-                if (candidate.equals(adminEmail)) continue;
+        pt.log("    🔍 Vòng 1 không thấy → hỏi Reports API tìm owner của folder ID: " + folderHistory.id, ProgressTracker.LogLevel.DETAIL);
+        String ownerEmail = findOwnerViaReportsApi(folderHistory.id, adminEmail);
+        if (ownerEmail != null && !ownerEmail.isBlank()) {
+            pt.log("    📋 Reports API → owner: " + ownerEmail, ProgressTracker.LogLevel.INFO);
+            if (!ownerEmail.equals(userEmail)) {
                 try {
-                    Drive candidateDrive = createDriveServiceForUserWithRetry(candidate);
-                    foundFolder = candidateDrive.files().get(folderHistory.id)
+                    Drive ownerDrive = createDriveServiceForUserWithRetry(ownerEmail);
+                    foundFolder = ownerDrive.files().get(folderHistory.id)
                             .setFields("id, name, parents, trashed, mimeType, owners, driveId")
                             .setSupportsAllDrives(true)
                             .execute();
-                    pt.log("    ✓ Tìm thấy tại Drive của: " + candidate + " → " + foundFolder.getName(), ProgressTracker.LogLevel.SUCCESS);
-                    return handleFoundFolder(folderHistory.id, foundFolder, userEmail, targetFolderId, targetFolderPath, result, candidate);
+                    pt.log("    ✅ Tìm thấy qua owner (" + ownerEmail + "): " + foundFolder.getName(), ProgressTracker.LogLevel.SUCCESS);
+                    return handleFoundFolder(folderHistory.id, foundFolder, userEmail, targetFolderId, targetFolderPath, result, ownerEmail);
                 } catch (com.google.api.client.googleapis.json.GoogleJsonResponseException e) {
-                    if (e.getStatusCode() == 404) continue;
-                    pt.log("    ⚠️  " + candidate + " lỗi " + e.getStatusCode(), ProgressTracker.LogLevel.DETAIL);
+                    pt.log("    ⚠️  Owner " + ownerEmail + " không truy cập được (" + e.getStatusCode() + ")", ProgressTracker.LogLevel.WARNING);
                 } catch (Exception e) {
-                    pt.log("    ⚠️  " + candidate + ": " + e.getMessage(), ProgressTracker.LogLevel.DETAIL);
+                    pt.log("    ⚠️  Lỗi khi truy cập Drive của owner " + ownerEmail + ": " + e.getMessage(), ProgressTracker.LogLevel.WARNING);
                 }
+            } else {
+                pt.log("    ℹ️  Owner trùng với user hiện tại → folder đã bị xóa khỏi Drive", ProgressTracker.LogLevel.DETAIL);
             }
+        } else {
+            pt.log("    ⚠️  Reports API không có log cho folder này → không xác định được owner", ProgressTracker.LogLevel.WARNING);
         }
 
-        result.reason = "Không tìm thấy folder trong toàn tổ chức";
+        result.reason = "Không tìm thấy folder (Reports API: " + (ownerEmail != null ? "owner=" + ownerEmail + " nhưng không truy cập được" : "không có log") + ")";
         result.movedFrom = "-";
-        pt.log("    ❌ Đã quét " + (searchUsers != null ? searchUsers.size() : 0) + " users, không tìm thấy folder", ProgressTracker.LogLevel.WARNING);
         return result;
     }
 
@@ -1210,21 +1164,125 @@ public class DriveRecoveryService {
                     if (attempt < maxRetries) {
                         try { Thread.sleep(waitMs); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
                     } else {
-                        throw e; // Hết retry → ném lỗi
+                        // 429 hết retry → không crash, bỏ qua activity cho folder này
+                        ProgressTracker.getInstance().log(
+                                "  ⚠️  Activity API 429 hết retry — bỏ qua activity",
+                                ProgressTracker.LogLevel.DETAIL);
+                        return new com.google.api.services.driveactivity.v2.model.QueryDriveActivityResponse();
                     }
                 } else {
-                    throw e; // Lỗi khác (404, 403...) → ném ngay
+                    // 403/404/other → KHÔNG crash, bỏ qua activity cho folder này
+                    String detail = (e.getDetails() != null && e.getDetails().getMessage() != null)
+                            ? e.getDetails().getMessage() : e.getMessage();
+                    ProgressTracker.getInstance().log(
+                            "  ⚠️  Activity API HTTP " + e.getStatusCode() + " (" + detail + ") — bỏ qua",
+                            ProgressTracker.LogLevel.DETAIL);
+                    return new com.google.api.services.driveactivity.v2.model.QueryDriveActivityResponse();
                 }
+            } catch (Exception e) {
+                // Network/IO/other lỗi → không crash, bỏ qua activity cho folder này
+                ProgressTracker.getInstance().log(
+                        "  ⚠️  Activity API lỗi: " + e.getClass().getSimpleName() + " — bỏ qua",
+                        ProgressTracker.LogLevel.DETAIL);
+                return new com.google.api.services.driveactivity.v2.model.QueryDriveActivityResponse();
             } finally {
                 activityApiSemaphore.release(); // Luôn release dù thành công hay fail
             }
         }
 
-        // Should never reach here
-        throw new IOException("Activity API retry exhausted");
+        // Fallback (không bao giờ tới đây)
+        return new com.google.api.services.driveactivity.v2.model.QueryDriveActivityResponse();
+    }
+
+    /**
+     * ⭐ MỚI: Dùng Admin SDK Reports API (giống Admin Console → Drive log events)
+     * để tìm owner của file/folder theo ID trong toàn bộ tổ chức.
+     *
+     * Thay thế vòng loop N users cũ → chỉ cần 1 API call để biết owner là ai.
+     *
+     * Reports API query: doc_id == fileId → trả về audit log events có chứa field "owner"
+     *
+     * @return email của owner, hoặc null nếu không có log nào
+     */
+    private String findOwnerViaReportsApi(String fileId, String adminEmail) {
+        ProgressTracker pt = ProgressTracker.getInstance();
+        if (adminEmail == null || adminEmail.isBlank()) {
+            pt.log("    ⚠️  Không có adminEmail → không thể dùng Reports API", ProgressTracker.LogLevel.DETAIL);
+            return null;
+        }
+        try {
+            // Tạo credentials impersonate admin với scope Reports API
+            com.google.auth.oauth2.GoogleCredentials adminCreds;
+            if (Config.isUseJsonFile()) {
+                adminCreds = com.google.auth.oauth2.ServiceAccountCredentials
+                        .fromStream(new java.io.FileInputStream(Config.getServiceAccountFile()))
+                        .createScoped(java.util.List.of(
+                                "https://www.googleapis.com/auth/admin.reports.audit.readonly"))
+                        .createDelegated(adminEmail);
+            } else {
+                adminCreds = com.google.auth.oauth2.ServiceAccountCredentials
+                        .fromStream(new java.io.ByteArrayInputStream(
+                                createServiceAccountJson().getBytes(java.nio.charset.StandardCharsets.UTF_8)))
+                        .createScoped(java.util.List.of(
+                                "https://www.googleapis.com/auth/admin.reports.audit.readonly"))
+                        .createDelegated(adminEmail);
+            }
+
+            // Khởi tạo Reports service
+            com.google.api.services.reports.Reports reportsService =
+                    new com.google.api.services.reports.Reports.Builder(
+                            com.google.api.client.googleapis.javanet.GoogleNetHttpTransport.newTrustedTransport(),
+                            com.google.api.client.json.gson.GsonFactory.getDefaultInstance(),
+                            new com.google.auth.http.HttpCredentialsAdapter(adminCreds))
+                            .setApplicationName("Drive Recovery Tool v2.0")
+                            .build();
+
+            // Query audit log: tìm tất cả events có doc_id == fileId
+            com.google.api.services.reports.model.Activities activities =
+                    reportsService.activities()
+                            .list("all", "drive")
+                            .setFilters("doc_id==" + fileId)
+                            .setMaxResults(10)
+                            .execute();
+
+            if (activities.getItems() == null || activities.getItems().isEmpty()) {
+                return null; // Không có log nào cho file/folder này
+            }
+
+            // Duyệt qua events, tìm field "owner" trong parameters
+            for (com.google.api.services.reports.model.Activity activity : activities.getItems()) {
+                if (activity.getEvents() == null) continue;
+                for (com.google.api.services.reports.model.Activity.Events event : activity.getEvents()) {
+                    if (event.getParameters() == null) continue;
+                    for (com.google.api.services.reports.model.Activity.Events.Parameters param : event.getParameters()) {
+                        if ("owner".equals(param.getName()) && param.getValue() != null && !param.getValue().isBlank()) {
+                            return param.getValue(); // ← owner email tìm thấy!
+                        }
+                    }
+                }
+            }
+
+            // Nếu không thấy field "owner" → thử lấy từ actor (người thực hiện action đầu tiên)
+            com.google.api.services.reports.model.Activity first = activities.getItems().get(0);
+            if (first.getActor() != null && first.getActor().getEmail() != null) {
+                pt.log("    ℹ️  Không có field 'owner' trong params → dùng actor: " + first.getActor().getEmail(), ProgressTracker.LogLevel.DETAIL);
+                return first.getActor().getEmail();
+            }
+
+        } catch (com.google.api.client.googleapis.json.GoogleJsonResponseException e) {
+            if (e.getStatusCode() == 403) {
+                pt.log("    ⚠️  Reports API 403 — Service Account chưa được grant scope admin.reports.audit.readonly", ProgressTracker.LogLevel.WARNING);
+            } else {
+                pt.log("    ⚠️  Reports API lỗi HTTP " + e.getStatusCode() + ": " + e.getMessage(), ProgressTracker.LogLevel.WARNING);
+            }
+        } catch (Exception e) {
+            pt.log("    ⚠️  Reports API exception: " + e.getMessage(), ProgressTracker.LogLevel.WARNING);
+        }
+        return null;
     }
 
     private Drive createDriveServiceForUserWithRetry(String userEmail) throws Exception {
+
         int maxRetries = 3;
         int retryCount = 0;
 
@@ -1476,18 +1534,22 @@ public class DriveRecoveryService {
         try {
             SimpleDateFormat displayFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
             displayFormat.setTimeZone(TimeZone.getTimeZone("GMT+7"));
-            SimpleDateFormat isoParser = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'");
-            isoParser.setTimeZone(TimeZone.getTimeZone("UTC"));
+            // Parser 1: có milliseconds — "2026-05-02T23:59:19.123Z"
+            SimpleDateFormat isoParserMs = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'");
+            isoParserMs.setTimeZone(TimeZone.getTimeZone("UTC"));
+            // Parser 2: không có milliseconds — "2026-05-02T23:59:19Z"
+            SimpleDateFormat isoParserNoMs = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'");
+            isoParserNoMs.setTimeZone(TimeZone.getTimeZone("UTC"));
 
             String earliestTime = "N/A";
             if (activities.get(0).getTimestamp() != null) {
-                earliestTime = displayFormat.format(isoParser.parse(activities.get(0).getTimestamp()));
+                earliestTime = displayFormat.format(parseIsoTimestamp(activities.get(0).getTimestamp(), isoParserMs, isoParserNoMs));
             }
 
             String latestTime = "N/A";
             if (activities.get(activities.size() - 1).getTimestamp() != null) {
                 latestTime = displayFormat.format(
-                        isoParser.parse(activities.get(activities.size() - 1).getTimestamp()));
+                        parseIsoTimestamp(activities.get(activities.size() - 1).getTimestamp(), isoParserMs, isoParserNoMs));
             }
 
             System.out.println("  📅 Khoảng activity đã đọc:");
@@ -2653,5 +2715,19 @@ public class DriveRecoveryService {
         String action; // "' Đã move" / "' Không tìm thấy" / "-"
         String movedFrom;
         String lastSeen;
+    }
+
+    /**
+     * Parse ISO timestamp với fallback: thử có milliseconds trước, rồi không có milliseconds.
+     * Activity API đôi khi trả về "2026-05-02T23:59:19Z" (không có .SSS).
+     */
+    private java.util.Date parseIsoTimestamp(String ts,
+            java.text.SimpleDateFormat parserWithMs,
+            java.text.SimpleDateFormat parserNoMs) throws java.text.ParseException {
+        try {
+            return parserWithMs.parse(ts);
+        } catch (java.text.ParseException e) {
+            return parserNoMs.parse(ts);
+        }
     }
 }
