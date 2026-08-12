@@ -127,32 +127,29 @@ public class DriveRecoveryService {
     }
 
     /**
-     * ⭐ MODE 2 — copy y hệt processUserDrive() của Mode 1.
-     * Khác duy nhất: Mode 1 lấy toàn bộ folder từ My Drive root của user,
-     * Mode 2 lấy folder cụ thể + toàn bộ subfolder con của nó.
+     * ⭐ MODE 2 — Xử lý 1 folder cụ thể theo ID.
+     *
+     * Flow: TaskRunner.runMode2() dùng admin hỏi folder ID → biết owner là ai + tên folder
+     *       → impersonate owner để tạo driveService + activityService
+     *       → truyền folderName xuống đây (không fetch lại).
+     *
+     * @param folderId   ID folder cần xử lý
+     * @param folderName Tên folder (admin đã fetch ở TaskRunner, không cần hỏi lại)
+     * @param userEmail  Email owner (admin đã detect ở TaskRunner)
      */
-    public String processSpecificFolder(String folderId, String userEmail) throws IOException {
+    public String processSpecificFolder(String folderId, String folderName, String userEmail) throws IOException {
         System.out.println("✓ Mode 2 đang xử lý folder: " + folderId + " | impersonate: " + userEmail);
 
-        // ── Lấy thông tin folder gốc (y hệt cách Mode 1 dùng driveService) ───
-        System.out.println("\n📁 Đang lấy thông tin folder gốc...");
-        File folderFile;
-        try {
-            folderFile = driveService.files().get(folderId)
-                    .setFields("id, name, parents")
-                    .setSupportsAllDrives(true)
-                    .execute();
-        } catch (Exception e) {
-            ProgressTracker.getInstance().log("❌ Không thể lấy thông tin folder: " + e.getMessage(),
-                    ProgressTracker.LogLevel.ERROR);
-            throw new IOException("Folder ID không hợp lệ hoặc không có quyền truy cập: " + folderId, e);
-        }
+        // ── Tên folder đã được TaskRunner fetch qua admin → dùng thẳng, không fetch lại ──
+        // (Tránh lỗi 404 khi impersonate owner mà folder không nằm trong My Drive của họ)
+        System.out.println("\n📁 Folder gốc: " + folderName + " (" + folderId + ")");
+        ProgressTracker.getInstance().log("📁 Folder: " + folderName + " | owner: " + userEmail,
+                ProgressTracker.LogLevel.INFO);
 
-        // Dùng tên folder làm root path (không dùng buildFolderPath vì không cần full path)
-        String rootPath = "/" + folderFile.getName();
+        String rootPath = "/" + folderName;
         FolderInfo rootFolder = new FolderInfo();
         rootFolder.id   = folderId;
-        rootFolder.name = folderFile.getName();
+        rootFolder.name = folderName;
         rootFolder.path = rootPath;
 
         // ── Lấy danh sách folders (Mode 1 dùng getAllFoldersRecursive từ root,
@@ -352,21 +349,49 @@ public class DriveRecoveryService {
             pt.log("  📁 [FOLDER] Đang kiểm tra subfolder trong: " + folder.path, ProgressTracker.LogLevel.INFO);
             List<FileHistory> foldersFromActivity = getDirectSubFoldersFromActivity(folder.id, userEmail);
 
-            if (!foldersFromActivity.isEmpty()) {
-                Set<String> currentSubfolderIds = getDirectSubfolderIds(folder.id, userEmail);
+            // ⭐ FIX: Lấy danh sách subfolder THỰC TẾ hiện có từ Drive API
+            // Merge với activity-based list để không bỏ sót folder được tạo bằng CREATE
+            // (CREATE event không có MOVE data → bị bỏ qua trong processActivityForFolders)
+            Set<String> currentSubfolderIds = getDirectSubfolderIds(folder.id, userEmail);
 
-                int totalFolders     = foldersFromActivity.size();
+            // Tập hợp tất cả folder IDs đã biết từ activity
+            Set<String> activityFolderIds = foldersFromActivity.stream()
+                    .map(fh -> fh.id)
+                    .collect(java.util.stream.Collectors.toSet());
+
+            // ⭐ FIX: Thêm vào list những folder HIỆN CÓ nhưng chưa xuất hiện trong activity
+            // Đây là những folder được tạo trực tiếp (CREATE) mà không bao giờ bị MOVE
+            List<FileHistory> mergedFolders = new ArrayList<>(foldersFromActivity);
+            for (String existingId : currentSubfolderIds) {
+                if (!activityFolderIds.contains(existingId)) {
+                    // Folder này không có trong activity → fetch tên qua Drive API
+                    FileHistory extraFh = new FileHistory();
+                    extraFh.id = existingId;
+                    extraFh.name = getFolderNameCached(existingId);
+                    extraFh.everInFolder = true;
+                    extraFh.currentlyInFolder = true;
+                    extraFh.lastSeenTimestamp = null;
+                    mergedFolders.add(extraFh);
+                    pt.log("  📁 Thêm folder có trong Drive nhưng chưa có activity: " + extraFh.name,
+                            ProgressTracker.LogLevel.DETAIL);
+                }
+            }
+
+            if (!mergedFolders.isEmpty()) {
+                int totalFolders     = mergedFolders.size();
                 int presentFolders   = 0;
                 int missingFolderCount = 0;
 
                 // ── In header bảng subfolder ──
                 pt.log("  ┌─────────────────────────────────────────────────────────────", ProgressTracker.LogLevel.INFO);
-                pt.log("  │ SUBFOLDER SUMMARY  (activity: " + totalFolders + ", hiện tại: " + currentSubfolderIds.size() + ")", ProgressTracker.LogLevel.INFO);
+                pt.log("  │ SUBFOLDER SUMMARY  (activity: " + foldersFromActivity.size()
+                        + ", drive hiện tại: " + currentSubfolderIds.size()
+                        + ", tổng merged: " + totalFolders + ")", ProgressTracker.LogLevel.INFO);
                 pt.log("  ├─────────┬────────────────────────────────────────────────────", ProgressTracker.LogLevel.INFO);
                 pt.log("  │  Trạng  │  Tên Subfolder", ProgressTracker.LogLevel.INFO);
                 pt.log("  ├─────────┼────────────────────────────────────────────────────", ProgressTracker.LogLevel.INFO);
 
-                for (FileHistory fh : foldersFromActivity) {
+                for (FileHistory fh : mergedFolders) {
                     SubFolderInfo sfInfo = new SubFolderInfo();
                     sfInfo.folderName = fh.name;
                     sfInfo.folderId   = fh.id;
@@ -425,7 +450,7 @@ public class DriveRecoveryService {
                         totalFolders, presentFolders, missingFolderCount),
                         missingFolderCount > 0 ? ProgressTracker.LogLevel.WARNING : ProgressTracker.LogLevel.SUCCESS);
             } else {
-                pt.log("  📁 Không có folder activity nào trong: " + folder.path, ProgressTracker.LogLevel.INFO);
+                pt.log("  📁 Không có subfolder nào trong: " + folder.path, ProgressTracker.LogLevel.INFO);
             }
         }
 
@@ -643,6 +668,40 @@ public class DriveRecoveryService {
                     pt.log("    ⚠️  Owner " + ownerEmail + " không truy cập được (" + e.getStatusCode() + ")", ProgressTracker.LogLevel.WARNING);
                 } catch (Exception e) {
                     pt.log("    ⚠️  Lỗi khi truy cập Drive của owner " + ownerEmail + ": " + e.getMessage(), ProgressTracker.LogLevel.WARNING);
+                    // ── Vòng 2b: invalid_grant / user không tồn tại trong domain ──
+                    // Ví dụ: quydt@sappedu.enterprise.io.vn → tìm quydt@* trong tổ chức
+                    String msg = e.getMessage() != null ? e.getMessage() : "";
+                    boolean isInvalidUser = msg.contains("invalid_grant") || msg.contains("Invalid email")
+                            || msg.contains("User ID") || msg.contains("400");
+                    if (isInvalidUser) {
+                        String username = ownerEmail.contains("@")
+                                ? ownerEmail.substring(0, ownerEmail.indexOf('@'))
+                                : "";
+                        if (!username.isBlank()) {
+                            pt.log("    🔄 Vòng 2b: tìm user có username '" + username + "' trong tổ chức...", ProgressTracker.LogLevel.DETAIL);
+                            List<String> sameUsernameList = Config.getAllUsersForSearch().stream()
+                                    .filter(u -> u != null && u.startsWith(username + "@")
+                                            && !u.equalsIgnoreCase(ownerEmail))
+                                    .collect(java.util.stream.Collectors.toList());
+                            if (sameUsernameList.isEmpty()) {
+                                pt.log("    ℹ️  Không tìm thấy user nào có username '" + username + "' trong tổ chức", ProgressTracker.LogLevel.DETAIL);
+                            }
+                            for (String altEmail : sameUsernameList) {
+                                pt.log("    🔄 Vòng 2b: thử " + altEmail, ProgressTracker.LogLevel.DETAIL);
+                                try {
+                                    Drive altDrive = createDriveServiceForUserWithRetry(altEmail);
+                                    fileLocation = altDrive.files().get(file.id)
+                                            .setFields("id, name, parents, trashed, mimeType, owners, driveId")
+                                            .setSupportsAllDrives(true)
+                                            .execute();
+                                    pt.log("    ✅ Tìm thấy qua " + altEmail + ": " + fileLocation.getName(), ProgressTracker.LogLevel.SUCCESS);
+                                    return handleFoundFile(file.id, fileLocation, userEmail, targetFolderId, targetFolderPath, subfolderIds, result, altEmail);
+                                } catch (Exception altEx) {
+                                    pt.log("    ⬝ " + altEmail + " không có file này", ProgressTracker.LogLevel.DETAIL);
+                                }
+                            }
+                        }
+                    }
                 }
             } else {
                 pt.log("    ℹ️  Owner trùng với user hiện tại → file đã bị xóa khỏi Drive", ProgressTracker.LogLevel.DETAIL);
@@ -651,7 +710,44 @@ public class DriveRecoveryService {
             pt.log("    ⚠️  Reports API không có log cho file này → không xác định được owner", ProgressTracker.LogLevel.WARNING);
         }
 
-        result.reason = "Không tìm thấy file (Reports API: " + (ownerEmail != null ? "owner=" + ownerEmail + " nhưng không truy cập được" : "không có log") + ")";
+        // ── Vòng 3: Quét toàn bộ allUsersForSearch (giống findAndMoveFolderWithResult) ──
+        List<String> allUsers = Config.getAllUsersForSearch();
+        if (!allUsers.isEmpty()) {
+            pt.log("    🔍 Vòng 3: Quét toàn bộ " + allUsers.size() + " users trong tổ chức...", ProgressTracker.LogLevel.DETAIL);
+            for (String otherUserEmail : allUsers) {
+                if (otherUserEmail.equals(userEmail)) continue;
+                try {
+                    Drive userDriveService = createDriveServiceForUserWithRetry(otherUserEmail);
+                    try {
+                        File candidate = userDriveService.files().get(file.id)
+                                .setFields("id, name, parents, trashed, mimeType, owners, driveId")
+                                .setSupportsAllDrives(true)
+                                .execute();
+                        if (candidate != null) {
+                            pt.log("    ✓ Vòng 3 tìm thấy trong Drive của: " + otherUserEmail, ProgressTracker.LogLevel.INFO);
+                            return handleFoundFile(file.id, candidate, userEmail, targetFolderId, targetFolderPath, subfolderIds, result, otherUserEmail);
+                        }
+                    } catch (com.google.api.client.googleapis.json.GoogleJsonResponseException gje) {
+                        int sc = gje.getStatusCode();
+                        if (sc == 404 || sc == 403) {
+                            // Không có → tiếp tục
+                        } else {
+                            pt.log("    ⚠️  Vòng 3 [" + otherUserEmail + "] HTTP " + sc, ProgressTracker.LogLevel.DETAIL);
+                        }
+                    }
+                } catch (Exception e) {
+                    // invalid_grant hoặc lỗi khác → bỏ qua, tiếp tục user tiếp theo
+                    String em = e.getMessage() != null ? e.getMessage() : "";
+                    if (!em.contains("invalid_grant") && !em.contains("Invalid email")) {
+                        pt.log("    ⚠️  Vòng 3 [" + otherUserEmail + "] lỗi: " + e.getClass().getSimpleName(), ProgressTracker.LogLevel.DETAIL);
+                    }
+                }
+            }
+            pt.log("    ❌ Vòng 3: Đã quét " + allUsers.size() + " users — không tìm thấy file", ProgressTracker.LogLevel.WARNING);
+        }
+
+        result.reason = "Không tìm thấy file sau 3 vòng tìm kiếm"
+                + (ownerEmail != null ? " (Reports API owner: " + ownerEmail + ")" : " (Reports API: không có log)");
         result.movedFrom = "-";
         return result;
     }
@@ -817,7 +913,6 @@ public class DriveRecoveryService {
         }
 
         // ── Vòng 2: Reports API → tìm owner qua audit log toàn tổ chức ───────
-        // Giống Admin Console: tra cứu folder ID trong Drive log events để biết owner là ai
         String adminEmail = Config.getAdminEmail();
         pt.log("    🔍 Vòng 1 không thấy → hỏi Reports API tìm owner của folder ID: " + folderHistory.id, ProgressTracker.LogLevel.DETAIL);
         String ownerEmail = findOwnerViaReportsApi(folderHistory.id, adminEmail);
@@ -836,6 +931,41 @@ public class DriveRecoveryService {
                     pt.log("    ⚠️  Owner " + ownerEmail + " không truy cập được (" + e.getStatusCode() + ")", ProgressTracker.LogLevel.WARNING);
                 } catch (Exception e) {
                     pt.log("    ⚠️  Lỗi khi truy cập Drive của owner " + ownerEmail + ": " + e.getMessage(), ProgressTracker.LogLevel.WARNING);
+                    // ── Vòng 2b: invalid_grant / user không tồn tại trong domain ──
+                    // Tìm trong allUsersForSearch user nào có cùng username
+                    // Ví dụ: tramhb@sappedu.enterprise.io.vn → tìm tramhb@* trong tổ chức → tramhb@sapp.edu.vn
+                    String msg = e.getMessage() != null ? e.getMessage() : "";
+                    boolean isInvalidUser = msg.contains("invalid_grant") || msg.contains("Invalid email")
+                            || msg.contains("User ID") || msg.contains("400");
+                    if (isInvalidUser) {
+                        String username = ownerEmail.contains("@")
+                                ? ownerEmail.substring(0, ownerEmail.indexOf('@'))
+                                : "";
+                        if (!username.isBlank()) {
+                            pt.log("    🔄 Vòng 2b: tìm user có username '" + username + "' trong tổ chức...", ProgressTracker.LogLevel.DETAIL);
+                            List<String> sameUsernameList = Config.getAllUsersForSearch().stream()
+                                    .filter(u -> u != null && u.startsWith(username + "@")
+                                            && !u.equalsIgnoreCase(ownerEmail))
+                                    .collect(java.util.stream.Collectors.toList());
+                            if (sameUsernameList.isEmpty()) {
+                                pt.log("    ℹ️  Không tìm thấy user nào có username '" + username + "' trong tổ chức", ProgressTracker.LogLevel.DETAIL);
+                            }
+                            for (String altEmail : sameUsernameList) {
+                                pt.log("    🔄 Vòng 2b: thử " + altEmail, ProgressTracker.LogLevel.DETAIL);
+                                try {
+                                    Drive altDrive = createDriveServiceForUserWithRetry(altEmail);
+                                    foundFolder = altDrive.files().get(folderHistory.id)
+                                            .setFields("id, name, parents, trashed, mimeType, owners, driveId")
+                                            .setSupportsAllDrives(true)
+                                            .execute();
+                                    pt.log("    ✅ Tìm thấy qua " + altEmail + ": " + foundFolder.getName(), ProgressTracker.LogLevel.SUCCESS);
+                                    return handleFoundFolder(folderHistory.id, foundFolder, userEmail, targetFolderId, targetFolderPath, result, altEmail);
+                                } catch (Exception altEx) {
+                                    pt.log("    ⬝ " + altEmail + " không có folder này", ProgressTracker.LogLevel.DETAIL);
+                                }
+                            }
+                        }
+                    }
                 }
             } else {
                 pt.log("    ℹ️  Owner trùng với user hiện tại → folder đã bị xóa khỏi Drive", ProgressTracker.LogLevel.DETAIL);
@@ -844,10 +974,74 @@ public class DriveRecoveryService {
             pt.log("    ⚠️  Reports API không có log cho folder này → không xác định được owner", ProgressTracker.LogLevel.WARNING);
         }
 
-        result.reason = "Không tìm thấy folder (Reports API: " + (ownerEmail != null ? "owner=" + ownerEmail + " nhưng không truy cập được" : "không có log") + ")";
+        // ── Vòng 3: Quét toàn bộ allUsersForSearch (giống code cũ) ───────────
+        List<String> allUsers = Config.getAllUsersForSearch();
+        if (!allUsers.isEmpty()) {
+            pt.log("    🔍 Vòng 3: Quét toàn bộ " + allUsers.size() + " users trong tổ chức...", ProgressTracker.LogLevel.DETAIL);
+            for (String otherUserEmail : allUsers) {
+                if (otherUserEmail.equals(userEmail)) continue;
+                try {
+                    Drive userDriveService = createDriveServiceForUserWithRetry(otherUserEmail);
+                    try {
+                        File candidate = userDriveService.files().get(folderHistory.id)
+                                .setFields("id, name, parents, trashed, mimeType, owners, driveId")
+                                .setSupportsAllDrives(true)
+                                .execute();
+                        if (candidate != null) {
+                            pt.log("    ✓ Vòng 3 tìm thấy trong Drive của: " + otherUserEmail, ProgressTracker.LogLevel.INFO);
+                            return handleFoundFolder(folderHistory.id, candidate, userEmail, targetFolderId, targetFolderPath, result, otherUserEmail);
+                        }
+                    } catch (com.google.api.client.googleapis.json.GoogleJsonResponseException gje) {
+                        int sc = gje.getStatusCode();
+                        if (sc == 404 || sc == 403) {
+                            // Không có → tiếp tục
+                        } else {
+                            pt.log("    ⚠️  Vòng 3 [" + otherUserEmail + "] HTTP " + sc, ProgressTracker.LogLevel.DETAIL);
+                        }
+                    }
+                } catch (Exception e) {
+                    // invalid_grant hoặc lỗi khác → bỏ qua, tiếp tục user tiếp theo
+                    String em = e.getMessage() != null ? e.getMessage() : "";
+                    if (!em.contains("invalid_grant") && !em.contains("Invalid email")) {
+                        pt.log("    ⚠️  Vòng 3 [" + otherUserEmail + "] lỗi: " + e.getClass().getSimpleName(), ProgressTracker.LogLevel.DETAIL);
+                    }
+                }
+            }
+            pt.log("    ❌ Vòng 3: Đã quét " + allUsers.size() + " users — không tìm thấy folder", ProgressTracker.LogLevel.WARNING);
+        }
+
+        result.reason = "Không tìm thấy folder sau 3 vòng tìm kiếm"
+                + (ownerEmail != null ? " (Reports API owner: " + ownerEmail + ")" : " (Reports API: không có log)");
         result.movedFrom = "-";
         return result;
     }
+
+    /**
+     * Tạo danh sách email thay thế bằng cách đổi domain của ownerEmail
+     * sang tất cả domain của các user trong allUsersForSearch.
+     * Không còn dùng trực tiếp — logic này đã được thay bằng username-prefix search trong vòng 2b.
+     * Giữ lại để tương thích nếu cần dùng lại.
+     */
+    private List<String> buildAlternateDomainEmails(String ownerEmail, List<String> allUsers) {
+        List<String> result = new ArrayList<>();
+        if (ownerEmail == null || !ownerEmail.contains("@")) return result;
+        String username = ownerEmail.substring(0, ownerEmail.indexOf('@'));
+        Set<String> knownDomains = new LinkedHashSet<>();
+        for (String u : allUsers) {
+            if (u != null && u.contains("@")) {
+                String domain = u.substring(u.indexOf('@') + 1);
+                if (!domain.isEmpty()) knownDomains.add(domain);
+            }
+        }
+        String originalDomain = ownerEmail.substring(ownerEmail.indexOf('@') + 1);
+        for (String domain : knownDomains) {
+            if (!domain.equals(originalDomain)) {
+                result.add(username + "@" + domain);
+            }
+        }
+        return result;
+    }
+
 
     private MoveResult handleFoundFolder(String folderId, File foundFolder, String userEmail,
             String targetFolderId, String targetFolderPath, MoveResult result, String finderEmail) {
@@ -1728,8 +1922,29 @@ public class DriveRecoveryService {
 
             boolean addedToFolder = false;
             boolean removedFromFolder = false;
+            boolean createdInFolder = false;
 
             for (ActionDetail detail : allActions) {
+                // ⭐ FIX: Detect CREATE event cho folder trực tiếp trong folderId
+                // ancestorName query trả về cả subtree → phải verify parent thực sự là folderId
+                // Dùng Drive API để check parents (chấp nhận 1 API call cho CREATE event)
+                if (detail.getCreate() != null) {
+                    try {
+                        com.google.api.services.drive.model.File folderMeta =
+                                driveService.files().get(foldItemId)
+                                        .setFields("parents, trashed")
+                                        .setSupportsAllDrives(true)
+                                        .execute();
+                        if (folderMeta.getParents() != null
+                                && folderMeta.getParents().contains(folderId)
+                                && (folderMeta.getTrashed() == null || !folderMeta.getTrashed())) {
+                            createdInFolder = true;
+                        }
+                    } catch (Exception ignored) {
+                        // Folder có thể đã bị xóa → không check được parents → bỏ qua
+                    }
+                }
+
                 if (detail.getMove() != null) {
                     Move move = detail.getMove();
                     if (move.getAddedParents() != null) {
@@ -1751,7 +1966,8 @@ public class DriveRecoveryService {
                 }
             }
 
-            if (!addedToFolder && !removedFromFolder) continue;
+            // Skip nếu không có sự kiện liên quan đến folderId
+            if (!addedToFolder && !removedFromFolder && !createdInFolder) continue;
 
             if (!map.containsKey(foldItemId)) {
                 FileHistory newFh = new FileHistory();
@@ -1764,6 +1980,16 @@ public class DriveRecoveryService {
             }
 
             FileHistory fh = map.get(foldItemId);
+
+            if (createdInFolder) {
+                // Folder được tạo và hiện vẫn đang trong folderId (đã verify ở trên)
+                fh.everInFolder = true;
+                fh.currentlyInFolder = true;
+                fh.name = foldItemName;
+                if (fh.lastSeenTimestamp == null) {
+                    fh.lastSeenTimestamp = timestamp;
+                }
+            }
 
             if (addedToFolder) {
                 fh.everInFolder = true;

@@ -308,25 +308,98 @@ public class TaskRunner extends SwingWorker<Void, String> {
         pt.log("════════════════════════════════════════", ProgressTracker.LogLevel.HEADER);
         pt.log("📁 Folder ID: " + folderId, ProgressTracker.LogLevel.INFO);
 
-        // ⭐ BƯỚC 1: Dùng admin fetch folder → detect owner thật (giống Mode 1 xác định userEmail trước)
-        pt.log("🔍 Đang xác định owner của folder bằng admin " + adminEmail + "...", ProgressTracker.LogLevel.INFO);
+        // ⭐ BƯỚC 1: Dùng admin fetch folder → detect owner + lấy tên folder
+        // (Admin có thể thấy mọi folder trong tổ chức, kể cả Shared Drive)
+        pt.log("🔍 Đang xác định owner + tên folder bằng admin " + adminEmail + "...", ProgressTracker.LogLevel.INFO);
         String ownerEmail = adminEmail; // fallback nếu không detect được
+        String folderName  = folderId;  // fallback tên = ID nếu không lấy được
+        boolean ownerDetected = false;
+
+        // Nếu user đã chọn sẵn email trong UI → ưu tiên dùng (có thể override sau nếu admin detect được)
+        if (appConfig.selectedUsers != null && !appConfig.selectedUsers.isEmpty()) {
+            ownerEmail = appConfig.selectedUsers.get(0);
+            pt.log("👤 Dùng user được chọn trong UI: " + ownerEmail, ProgressTracker.LogLevel.INFO);
+            ownerDetected = true;
+        }
+
         try {
             Drive adminDrive = createDriveServiceForUser(adminEmail);
             com.google.api.services.drive.model.File folderMeta = adminDrive.files().get(folderId)
-                    .setFields("id, name, owners")
+                    .setFields("id, name, owners, driveId")
                     .setSupportsAllDrives(true)
                     .execute();
+
+            // Lấy tên folder → truyền xuống processSpecificFolder (không fetch lại)
+            if (folderMeta.getName() != null && !folderMeta.getName().isBlank()) {
+                folderName = folderMeta.getName();
+                pt.log("📁 Tên folder: " + folderName, ProgressTracker.LogLevel.INFO);
+            } else {
+                pt.log("⚠️ Admin fetch được metadata nhưng tên folder rỗng — có thể folder bị ẩn hoặc không có quyền xem tên", ProgressTracker.LogLevel.WARNING);
+            }
+
+            // Trường hợp My Drive: lấy owner từ metadata
             if (folderMeta.getOwners() != null && !folderMeta.getOwners().isEmpty()) {
                 String detected = folderMeta.getOwners().get(0).getEmailAddress();
                 if (detected != null && !detected.isBlank()) {
                     ownerEmail = detected;
-                    pt.log("👤 Owner phát hiện: " + ownerEmail, ProgressTracker.LogLevel.SUCCESS);
+                    ownerDetected = true;
+                    pt.log("👤 Owner (My Drive): " + ownerEmail, ProgressTracker.LogLevel.SUCCESS);
                 }
             }
+            // Trường hợp Shared Drive: owners = null → dùng selectedUsers (đã set ở trên) hoặc admin
+            else if (folderMeta.getDriveId() != null && !folderMeta.getDriveId().isBlank()) {
+                pt.log("ℹ️  Folder trong Shared Drive: " + folderMeta.getDriveId()
+                        + " → impersonate: " + ownerEmail, ProgressTracker.LogLevel.WARNING);
+            } else if (!ownerDetected) {
+                pt.log("⚠️ Không tìm được owner từ metadata và không có user nào được chọn trong UI", ProgressTracker.LogLevel.WARNING);
+            }
+
         } catch (Exception e) {
-            pt.log("⚠️ Không fetch được folder metadata: " + e.getMessage()
-                    + " → fallback dùng admin: " + adminEmail, ProgressTracker.LogLevel.WARNING);
+            pt.log("⚠️ Không fetch được folder metadata qua admin: " + e.getMessage(), ProgressTracker.LogLevel.WARNING);
+            if (!ownerDetected) {
+                pt.log("⚠️ Chưa detect được owner → sẽ thử lần lượt từng user trong selectedUsers để tìm ai có quyền đọc folder", ProgressTracker.LogLevel.WARNING);
+            }
+        }
+
+        // ⭐ FIX: Nếu chưa detect được owner (ownerEmail vẫn là adminEmail) → thử từng selectedUser
+        // Admin impersonate chính mình KHÔNG có quyền xem My Drive của user khác
+        // → phải tìm user thực sự có quyền đọc folderId này
+        if (!ownerDetected || ownerEmail.equals(adminEmail)) {
+            pt.log("🔍 Đang thử từng user trong selectedUsers để tìm owner thực sự của folder...", ProgressTracker.LogLevel.INFO);
+            List<String> candidates = new ArrayList<>();
+            if (appConfig.selectedUsers != null) candidates.addAll(appConfig.selectedUsers);
+            // Thêm một số user từ Config nếu có
+            candidates.addAll(Config.getAllUsersForSearch().stream()
+                    .filter(u -> !candidates.contains(u))
+                    .limit(10)  // Thử tối đa 10 user đầu để không mất quá nhiều thời gian
+                    .collect(java.util.stream.Collectors.toList()));
+
+            for (String candidate : candidates) {
+                if (candidate.equals(adminEmail)) continue; // admin đã thử rồi
+                try {
+                    Drive candidateDrive = createDriveServiceForUser(candidate);
+                    com.google.api.services.drive.model.File meta = candidateDrive.files().get(folderId)
+                            .setFields("id, name, owners")
+                            .setSupportsAllDrives(true)
+                            .execute();
+                    if (meta != null) {
+                        ownerEmail = candidate;
+                        ownerDetected = true;
+                        if (meta.getName() != null && !meta.getName().isBlank() && folderName.equals(folderId)) {
+                            folderName = meta.getName();
+                            pt.log("📁 Tên folder (qua candidate): " + folderName, ProgressTracker.LogLevel.INFO);
+                        }
+                        pt.log("✅ Tìm thấy: user [" + candidate + "] có quyền đọc folder → dùng làm owner", ProgressTracker.LogLevel.SUCCESS);
+                        break;
+                    }
+                } catch (Exception ignored) {
+                    pt.log("  ⬝ [" + candidate + "] không có quyền", ProgressTracker.LogLevel.DETAIL);
+                }
+            }
+
+            if (!ownerDetected || ownerEmail.equals(adminEmail)) {
+                pt.log("⚠️ Không tìm được user nào có quyền đọc folder → tiếp tục với adminEmail (kết quả có thể thiếu)", ProgressTracker.LogLevel.WARNING);
+            }
         }
 
         // ⭐ BƯỚC 2: Xây dựng search list để tìm file/folder thất lạc
@@ -398,7 +471,8 @@ public class TaskRunner extends SwingWorker<Void, String> {
         logFilterConfig(pt);
 
         DriveRecoveryService recoveryService = new DriveRecoveryService(driveService, activityService);
-        String reportPath = recoveryService.processSpecificFolder(folderId, ownerEmail);
+        // Truyền folderName (đã lấy qua admin ở BƯỚC 1) → không cần fetch lại trong DriveRecoveryService
+        String reportPath = recoveryService.processSpecificFolder(folderId, folderName, ownerEmail);
 
         pt.log("\n✅ Hoàn thành! Báo cáo: " + reportPath, ProgressTracker.LogLevel.SUCCESS);
     }
