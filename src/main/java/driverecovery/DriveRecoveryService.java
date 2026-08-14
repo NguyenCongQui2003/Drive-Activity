@@ -465,32 +465,55 @@ public class DriveRecoveryService {
         ptf.log("  📄 [FILE] Đang đọc Activity history cho files trong: " + folder.path, ProgressTracker.LogLevel.INFO);
         List<FileHistory> filesFromActivity = getFilesFromActivity(folder.id, userEmail);
 
-        if (filesFromActivity.isEmpty()) {
-            ptf.log("  📄 Không có file activity nào trong: " + folder.path, ProgressTracker.LogLevel.INFO);
-            return report;
-        }
-
+        // ⭐ Luôn lấy danh sách file thực tế từ Drive API (giống folder)
         List<File> currentFiles = getCurrentFilesInFolder(folder.id, userEmail);
         Set<String> currentFileIds = currentFiles.stream()
                 .map(File::getId)
                 .collect(Collectors.toSet());
 
+        // ⭐ MERGE: Thêm file đang có trong Drive nhưng chưa có activity
+        // (file được upload/tạo trực tiếp mà không có MOVE event nào)
+        Set<String> activityFileIds = filesFromActivity.stream()
+                .map(fh -> fh.id)
+                .collect(Collectors.toSet());
+
+        List<FileHistory> mergedFiles = new ArrayList<>(filesFromActivity);
+        for (File existingFile : currentFiles) {
+            if (!activityFileIds.contains(existingFile.getId())) {
+                FileHistory extraFh = new FileHistory();
+                extraFh.id = existingFile.getId();
+                extraFh.name = existingFile.getName();
+                extraFh.everInFolder = true;
+                extraFh.currentlyInFolder = true;
+                extraFh.lastSeenTimestamp = null;
+                mergedFiles.add(extraFh);
+                ptf.log("  📄 Thêm file có trong Drive nhưng chưa có activity: " + extraFh.name,
+                        ProgressTracker.LogLevel.DETAIL);
+            }
+        }
+
+        if (mergedFiles.isEmpty()) {
+            ptf.log("  📄 Không có file nào trong: " + folder.path, ProgressTracker.LogLevel.INFO);
+            return report;
+        }
+
         Set<String> subfolderIds = getAllSubfolderIds(folder.id, userEmail);
         Set<String> filesInSubfolders = getAllFilesInSubfolders(subfolderIds, userEmail);
 
-        int totalFiles      = filesFromActivity.size();
+        int totalFiles      = mergedFiles.size();
         int presentFiles    = 0;
         int inSubfolder     = 0;
         int missingCount    = 0;
 
         // ── In header bảng file ──
         ptf.log("  ┌─────────────────────────────────────────────────────────────", ProgressTracker.LogLevel.INFO);
-        ptf.log("  │ FILE SUMMARY  (activity: " + totalFiles + ", hiện tại: " + currentFiles.size() + ", trong subfolder: " + filesInSubfolders.size() + ")", ProgressTracker.LogLevel.INFO);
+        ptf.log("  │ FILE SUMMARY  (activity: " + filesFromActivity.size() + ", drive hiện tại: " + currentFiles.size()
+                + ", tổng merged: " + totalFiles + ", trong subfolder: " + filesInSubfolders.size() + ")", ProgressTracker.LogLevel.INFO);
         ptf.log("  ├──────────────────┬──────────────────────────────────────────", ProgressTracker.LogLevel.INFO);
         ptf.log("  │  Trạng thái      │  Tên File", ProgressTracker.LogLevel.INFO);
         ptf.log("  ├──────────────────┼──────────────────────────────────────────", ProgressTracker.LogLevel.INFO);
 
-        for (FileHistory fileHistory : filesFromActivity) {
+        for (FileHistory fileHistory : mergedFiles) {
             FileInfo fileInfo = new FileInfo();
             fileInfo.fileName  = fileHistory.name;
             fileInfo.fileId    = fileHistory.id;
@@ -558,6 +581,7 @@ public class DriveRecoveryService {
                 totalFiles, presentFiles, inSubfolder, missingCount),
                 missingCount > 0 ? ProgressTracker.LogLevel.WARNING : ProgressTracker.LogLevel.SUCCESS);
         return report;
+
     }
 
     /**
@@ -1804,11 +1828,28 @@ public class DriveRecoveryService {
 
             boolean addedToFolder = false;
             boolean removedFromFolder = false;
-            // Fix #1: Removed createdInFolder — ancestorName trả về tất cả subtree,
-            // CREATE event từ subfolder sẽ sai dạnh mark everInFolder=true cho folder cha.
-            // Chỉ dùng MOVE event với addedParents/removedParents để xác định parent trực tiếp.
 
             for (ActionDetail detail : allActions) {
+                // ⭐ CREATE — xử lý giống folder: verify parent bằng Drive API
+                // ancestorName trả về cả subtree → phải check parents thực tế
+                // Bắt: file upload trực tiếp vào folder (không qua MOVE)
+                if (detail.getCreate() != null) {
+                    try {
+                        com.google.api.services.drive.model.File fileMeta =
+                                driveService.files().get(fileId)
+                                        .setFields("parents, trashed")
+                                        .setSupportsAllDrives(true)
+                                        .execute();
+                        if (fileMeta.getParents() != null
+                                && fileMeta.getParents().contains(folderId)
+                                && (fileMeta.getTrashed() == null || !fileMeta.getTrashed())) {
+                            addedToFolder = true;
+                        }
+                    } catch (Exception ignored) {
+                        // File đã bị xóa → không verify được parents → bỏ qua CREATE này
+                    }
+                }
+
                 // ⭐ MOVE
                 if (detail.getMove() != null) {
                     Move move = detail.getMove();
@@ -1831,7 +1872,6 @@ public class DriveRecoveryService {
                         }
                     }
                 }
-                // Fix #1: Không xét CREATE/EDIT — không thể xác định parent trực tiếp từ ancestorName
             }
 
             if (!addedToFolder && !removedFromFolder) {
