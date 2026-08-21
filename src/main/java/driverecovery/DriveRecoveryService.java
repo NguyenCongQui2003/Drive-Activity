@@ -35,8 +35,16 @@ public class DriveRecoveryService {
     private volatile boolean timedOut = false;
 
     // ⭐ FIX 429: Semaphore đảm bảo chỉ 1 thread gọi Activity API tại một thời điểm.
-    // Activity API quota là "per user per minute" → 3 threads cùng gọi = 3x quota consumption.
+    // Activity API quota là "per user per minute" → 3 threads cùng gọi = 3x quota
+    // consumption.
     private final java.util.concurrent.Semaphore activityApiSemaphore = new java.util.concurrent.Semaphore(1);
+
+    // ⭐ Cross-user recovery registry: lưu IDs của items đã được recover thành công.
+    // STATIC → tồn tại xuyên suốt toàn bộ run, chia sẻ giữa tất cả
+    // DriveRecoveryService instances.
+    // Mục đích: ngăn vòng lặp chéo user — khi UserA đã recover X về folderA,
+    // UserB sẽ KHÔNG được move X từ folderA sang folderB (undo recovery).
+    private static final Set<String> globalRecoveredIds = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     public DriveRecoveryService(Drive driveService, DriveActivity activityService) {
         this.driveService = driveService;
@@ -48,10 +56,19 @@ public class DriveRecoveryService {
 
         System.out.println("\n📂 Đang quét tất cả folder trong My Drive...");
         List<FolderInfo> allFolders = getAllFoldersRecursive(userEmail);
-        System.out.println("✓ Tìm thấy " + allFolders.size() + " folder\n");
+        // ⭐ FIX: Đảo ngược → xử lý folder sâu nhất trước (deepest-first).
+        // DELETE event không có parent info. Khi B và D cùng thấy DELETE event của C
+        // (C là con của D, D là con của B), cần D xử lý trước để kéo C về D.
+        // Sau khi D kéo C về, B chạy sau: C.parents=[D], D∈allDescendantIds(B)
+        // → grandchild check block → B bỏ qua C. Đúng!
+        Collections.reverse(allFolders);
+        System.out.println("✓ Tìm thấy " + allFolders.size() + " folder (deepest-first)\n");
 
-        int threadCount = Math.min(3, Math.max(1, allFolders.size() / 100 + 1));
-        System.out.println("🚀 Bắt đầu xử lý SONG SONG với " + threadCount + " thread(s)...\n");
+        // ⭐ FIX: threadCount=1 để đảm bảo thứ tự deepest-first được tuân thủ.
+        // Parallel processing gây race condition: B và D chạy đồng thời → B có thể
+        // thắng → C kẹt ở B thay vì D. Sequential đảm bảo đúng thứ tự.
+        int threadCount = 1;
+        System.out.println("🚀 Bắt đầu xử lý tuần tự deepest-first...\n");
 
         java.util.concurrent.ExecutorService executor = java.util.concurrent.Executors.newFixedThreadPool(threadCount);
         java.util.concurrent.atomic.AtomicInteger processedCount = new java.util.concurrent.atomic.AtomicInteger(0);
@@ -78,7 +95,8 @@ public class DriveRecoveryService {
                 } catch (Exception e) {
                     errorCount.incrementAndGet();
                     String errMsg = (e instanceof com.google.api.client.googleapis.json.GoogleJsonResponseException gje)
-                            ? "HTTP " + gje.getStatusCode() + ": " + (gje.getDetails() != null ? gje.getDetails().getMessage() : gje.getMessage())
+                            ? "HTTP " + gje.getStatusCode() + ": "
+                                    + (gje.getDetails() != null ? gje.getDetails().getMessage() : gje.getMessage())
                             : e.getClass().getSimpleName() + ": " + e.getMessage();
                     synchronized (System.err) {
                         System.err.println("  ❌ Lỗi tại " + folder.path + ": " + errMsg);
@@ -103,9 +121,9 @@ public class DriveRecoveryService {
 
             if (!finished) {
                 String timeoutMsg = String.format(
-                    "⚠️  TIMEOUT! User [%s] chưa hoàn thành sau 24 giờ. Đã xử lý: %d/%d folder (%.1f%%)",
-                    userEmail, processedCount.get(), allFolders.size(),
-                    allFolders.size() > 0 ? processedCount.get() * 100.0 / allFolders.size() : 0);
+                        "⚠️  TIMEOUT! User [%s] chưa hoàn thành sau 24 giờ. Đã xử lý: %d/%d folder (%.1f%%)",
+                        userEmail, processedCount.get(), allFolders.size(),
+                        allFolders.size() > 0 ? processedCount.get() * 100.0 / allFolders.size() : 0);
                 System.err.println(timeoutMsg);
                 ProgressTracker.getInstance().log(timeoutMsg, ProgressTracker.LogLevel.ERROR);
                 timedOut = true;
@@ -129,9 +147,10 @@ public class DriveRecoveryService {
     /**
      * ⭐ MODE 2 — Xử lý 1 folder cụ thể theo ID.
      *
-     * Flow: TaskRunner.runMode2() dùng admin hỏi folder ID → biết owner là ai + tên folder
-     *       → impersonate owner để tạo driveService + activityService
-     *       → truyền folderName xuống đây (không fetch lại).
+     * Flow: TaskRunner.runMode2() dùng admin hỏi folder ID → biết owner là ai + tên
+     * folder
+     * → impersonate owner để tạo driveService + activityService
+     * → truyền folderName xuống đây (không fetch lại).
      *
      * @param folderId   ID folder cần xử lý
      * @param folderName Tên folder (admin đã fetch ở TaskRunner, không cần hỏi lại)
@@ -140,20 +159,22 @@ public class DriveRecoveryService {
     public String processSpecificFolder(String folderId, String folderName, String userEmail) throws IOException {
         System.out.println("✓ Mode 2 đang xử lý folder: " + folderId + " | impersonate: " + userEmail);
 
-        // ── Tên folder đã được TaskRunner fetch qua admin → dùng thẳng, không fetch lại ──
-        // (Tránh lỗi 404 khi impersonate owner mà folder không nằm trong My Drive của họ)
+        // ── Tên folder đã được TaskRunner fetch qua admin → dùng thẳng, không fetch
+        // lại ──
+        // (Tránh lỗi 404 khi impersonate owner mà folder không nằm trong My Drive của
+        // họ)
         System.out.println("\n📁 Folder gốc: " + folderName + " (" + folderId + ")");
         ProgressTracker.getInstance().log("📁 Folder: " + folderName + " | owner: " + userEmail,
                 ProgressTracker.LogLevel.INFO);
 
         String rootPath = "/" + folderName;
         FolderInfo rootFolder = new FolderInfo();
-        rootFolder.id   = folderId;
+        rootFolder.id = folderId;
         rootFolder.name = folderName;
         rootFolder.path = rootPath;
 
         // ── Lấy danh sách folders (Mode 1 dùng getAllFoldersRecursive từ root,
-        //    Mode 2 dùng [rootFolder] + getFoldersRecursiveHelper từ folderId) ──
+        // Mode 2 dùng [rootFolder] + getFoldersRecursiveHelper từ folderId) ──
         System.out.println("\n📂 Đang quét tất cả subfolder trong folder...");
         List<FolderInfo> allFolders = new ArrayList<>();
         allFolders.add(rootFolder);
@@ -189,7 +210,8 @@ public class DriveRecoveryService {
                 } catch (Exception e) {
                     errorCount.incrementAndGet();
                     String errMsg = (e instanceof com.google.api.client.googleapis.json.GoogleJsonResponseException gje)
-                            ? "HTTP " + gje.getStatusCode() + ": " + (gje.getDetails() != null ? gje.getDetails().getMessage() : gje.getMessage())
+                            ? "HTTP " + gje.getStatusCode() + ": "
+                                    + (gje.getDetails() != null ? gje.getDetails().getMessage() : gje.getMessage())
                             : e.getClass().getSimpleName() + ": " + e.getMessage();
                     synchronized (System.err) {
                         System.err.println("  ❌ Lỗi tại " + folder.path + ": " + errMsg);
@@ -198,8 +220,8 @@ public class DriveRecoveryService {
 
                     FolderReport errorReport = new FolderReport();
                     errorReport.folderPath = folder.path;
-                    errorReport.folderId   = folder.id;
-                    errorReport.error      = errMsg;
+                    errorReport.folderId = folder.id;
+                    errorReport.error = errMsg;
                     allReports.add(errorReport);
                 }
             });
@@ -214,9 +236,9 @@ public class DriveRecoveryService {
 
             if (!finished) {
                 String timeoutMsg = String.format(
-                    "⚠️  TIMEOUT! Folder [%s] của user [%s] chưa hoàn thành sau 24 giờ. Đã xử lý: %d/%d folder (%.1f%%)",
-                    folderId, userEmail, processedCount.get(), allFolders.size(),
-                    allFolders.size() > 0 ? processedCount.get() * 100.0 / allFolders.size() : 0);
+                        "⚠️  TIMEOUT! Folder [%s] của user [%s] chưa hoàn thành sau 24 giờ. Đã xử lý: %d/%d folder (%.1f%%)",
+                        folderId, userEmail, processedCount.get(), allFolders.size(),
+                        allFolders.size() > 0 ? processedCount.get() * 100.0 / allFolders.size() : 0);
                 System.err.println(timeoutMsg);
                 ProgressTracker.getInstance().log(timeoutMsg, ProgressTracker.LogLevel.ERROR);
                 timedOut = true;
@@ -243,7 +265,6 @@ public class DriveRecoveryService {
         return reportPath;
     }
 
-
     /**
      * Xây dựng path đầy đủ từ root đến folder theo ID.
      */
@@ -259,15 +280,19 @@ public class DriveRecoveryService {
                         .execute();
                 parts.add(0, f.getName());
                 List<String> parents = f.getParents();
-                if (parents == null || parents.isEmpty()) break;
+                if (parents == null || parents.isEmpty())
+                    break;
                 String nextId = parents.get(0);
                 // Dừng khi lên đến My Drive root
                 try {
                     File parentFile = driveService.files().get(nextId)
                             .setFields("name")
                             .execute();
-                    if ("My Drive".equals(parentFile.getName())) break;
-                } catch (Exception ignored) { break; }
+                    if ("My Drive".equals(parentFile.getName()))
+                        break;
+                } catch (Exception ignored) {
+                    break;
+                }
                 currentId = nextId;
             }
             return "/" + String.join("/", parts);
@@ -354,6 +379,11 @@ public class DriveRecoveryService {
             // (CREATE event không có MOVE data → bị bỏ qua trong processActivityForFolders)
             Set<String> currentSubfolderIds = getDirectSubfolderIds(folder.id, userEmail);
 
+            // ⭐ FIX: Lấy TẤT CẢ subfolder ID trong subtree (đệ quy, có cache)
+            // Dùng để kiểm tra folder "thiếu" có thực sự thiếu hay chỉ đang nằm
+            // sâu hơn trong cây (grandchild) — tránh move nhầm folder đang còn đó
+            Set<String> allDescendantIds = getAllSubfolderIds(folder.id, userEmail);
+
             // Tập hợp tất cả folder IDs đã biết từ activity
             Set<String> activityFolderIds = foldersFromActivity.stream()
                     .map(fh -> fh.id)
@@ -378,65 +408,192 @@ public class DriveRecoveryService {
             }
 
             if (!mergedFolders.isEmpty()) {
-                int totalFolders     = mergedFolders.size();
-                int presentFolders   = 0;
+                int totalFolders = mergedFolders.size();
+                int presentFolders = 0;
+                int inSubtreeCount = 0;
                 int missingFolderCount = 0;
 
                 // ── In header bảng subfolder ──
-                pt.log("  ┌─────────────────────────────────────────────────────────────", ProgressTracker.LogLevel.INFO);
+                pt.log("  ┌─────────────────────────────────────────────────────────────",
+                        ProgressTracker.LogLevel.INFO);
                 pt.log("  │ SUBFOLDER SUMMARY  (activity: " + foldersFromActivity.size()
                         + ", drive hiện tại: " + currentSubfolderIds.size()
                         + ", tổng merged: " + totalFolders + ")", ProgressTracker.LogLevel.INFO);
-                pt.log("  ├─────────┬────────────────────────────────────────────────────", ProgressTracker.LogLevel.INFO);
+                pt.log("  ├─────────┬────────────────────────────────────────────────────",
+                        ProgressTracker.LogLevel.INFO);
                 pt.log("  │  Trạng  │  Tên Subfolder", ProgressTracker.LogLevel.INFO);
-                pt.log("  ├─────────┼────────────────────────────────────────────────────", ProgressTracker.LogLevel.INFO);
+                pt.log("  ├─────────┼────────────────────────────────────────────────────",
+                        ProgressTracker.LogLevel.INFO);
 
                 for (FileHistory fh : mergedFolders) {
                     SubFolderInfo sfInfo = new SubFolderInfo();
                     sfInfo.folderName = fh.name;
-                    sfInfo.folderId   = fh.id;
-                    sfInfo.lastSeen   = fh.lastSeenTimestamp != null ? fh.lastSeenTimestamp : "N/A";
+                    sfInfo.folderId = fh.id;
+                    sfInfo.lastSeen = fh.lastSeenTimestamp != null ? fh.lastSeenTimestamp : "N/A";
 
                     if (currentSubfolderIds.contains(fh.id)) {
-                        // ── CÓ: đang tồn tại, bỏ qua ──
+                        // ── CÓ: đang là direct child, bỏ qua ──
                         presentFolders++;
-                        sfInfo.status   = "Có";
-                        sfInfo.action   = "-";
+                        sfInfo.status = "Có";
+                        sfInfo.action = "-";
                         sfInfo.movedFrom = "-";
                         pt.log("  │  ✅ Có  │  " + fh.name, ProgressTracker.LogLevel.INFO);
+
+                    } else if (allDescendantIds.contains(fh.id)) {
+                        // ── TRONG SUBTREE: folder đang nằm sâu hơn (grandchild) — KHÔNG move ──
+                        // Lý do: từng là direct child của folder này, nhưng sau đó được move
+                        // vào một subfolder con → vẫn đang trong cây, không bị mất
+                        inSubtreeCount++;
+                        sfInfo.status = "Trong subfolder con";
+                        sfInfo.action = "Không cần move (đang là grandchild)";
+                        sfInfo.movedFrom = "-";
+                        pt.log("  │  📂 Subfolder con │  " + fh.name + "  (bỏ qua — đang là grandchild)",
+                                ProgressTracker.LogLevel.INFO);
+
+                    } else if (fh.deletedFromSubtree && !fh.everInFolder) {
+                        // ── BỊ XÓA qua DELETE event ──
+                        // Không biết chắc là direct child hay grandchild → verify trước.
+                        // Logic:
+                        // • Trong Trash → báo cáo "Trong Thùng rác", KHÔNG move
+                        // • Không Trash → tồn tại nhưng bị move đi → move về đúng folder
+                        // • 404 → đã xóa vĩnh viễn
+                        missingFolderCount++;
+                        sfInfo.status = "Bị xóa";
+                        pt.log("  │  🗑️ DELETE event │  " + fh.name + "  →  đang verify...",
+                                ProgressTracker.LogLevel.WARNING);
+                        try {
+                            com.google.api.services.drive.model.File deletedFolder = null;
+                            boolean verifyFailed = false;
+                            try {
+                                deletedFolder = driveService.files().get(fh.id)
+                                        .setFields("id, name, trashed, explicitlyTrashed, parents, owners, driveId")
+                                        .setSupportsAllDrives(true)
+                                        .execute();
+                            } catch (com.google.api.client.googleapis.json.GoogleJsonResponseException gje) {
+                                verifyFailed = true;
+                                if (gje.getStatusCode() == 404) {
+                                    sfInfo.status = "Đã xóa vĩnh viễn";
+                                    sfInfo.action = "Đã xóa vĩnh viễn khỏi Drive";
+                                    sfInfo.movedFrom = "-";
+                                    pt.log("  │           │    ↳ ❌ Đã xóa vĩnh viễn (404)",
+                                            ProgressTracker.LogLevel.WARNING);
+                                } else {
+                                    sfInfo.action = "Lỗi verify: HTTP " + gje.getStatusCode();
+                                    sfInfo.movedFrom = "-";
+                                    pt.log("  │           │    ↳ ⚠️  Lỗi HTTP " + gje.getStatusCode(),
+                                            ProgressTracker.LogLevel.WARNING);
+                                }
+                            }
+
+                            if (!verifyFailed && deletedFolder != null) {
+                                boolean inTrash = Boolean.TRUE.equals(deletedFolder.getTrashed())
+                                        || Boolean.TRUE.equals(deletedFolder.getExplicitlyTrashed());
+
+                                if (inTrash) {
+                                    // ── TRONG TRASH → chỉ báo cáo, KHÔNG move ──
+                                    String ownerInfo = (deletedFolder.getOwners() != null
+                                            && !deletedFolder.getOwners().isEmpty())
+                                                    ? deletedFolder.getOwners().get(0).getEmailAddress()
+                                                    : "unknown";
+                                    sfInfo.status = "Trong Thùng rác";
+                                    sfInfo.action = "Đang trong Thùng rác — không tự động move";
+                                    sfInfo.movedFrom = "Trash (owner: " + ownerInfo + ")";
+                                    pt.log("  │           │    ↳ 🗑️  Folder đang trong TRASH của " + ownerInfo
+                                            + " — bỏ qua, không move", ProgressTracker.LogLevel.WARNING);
+
+                                } else {
+                                    // ── KHÔNG TRONG TRASH → folder vẫn còn, move về đúng folder ──
+                                    pt.log("  │           │    ↳ ✅ Folder vẫn tồn tại (không trong Trash) → đang move về...",
+                                            ProgressTracker.LogLevel.INFO);
+                                    MoveResult mr = findAndMoveFolderWithResult(fh, folder.id, folder.path, userEmail);
+                                    sfInfo.status = mr.success ? "Đã move về" : "Thiếu";
+                                    sfInfo.action = mr.success ? "Đã move" : "Không move được: " + mr.reason;
+                                    sfInfo.movedFrom = mr.movedFrom != null ? mr.movedFrom : "-";
+
+                                    if (mr.success) {
+                                        pt.log("  │           │    ↳ ✅ Move thành công từ: " + sfInfo.movedFrom,
+                                                ProgressTracker.LogLevel.SUCCESS);
+                                    } else {
+                                        pt.log("  │           │    ↳ ⚠️  " + mr.reason,
+                                                ProgressTracker.LogLevel.WARNING);
+                                    }
+
+                                    // Đệ quy kiểm tra bên trong nếu move thành công
+                                    if (mr.actuallyMoved && processedFolderIds.add(fh.id)) {
+                                        FolderInfo restoredFolder = new FolderInfo();
+                                        restoredFolder.id = fh.id;
+                                        restoredFolder.name = fh.name;
+                                        restoredFolder.path = folder.path + "/" + fh.name;
+                                        try {
+                                            pt.log("  🔄 Đệ quy kiểm tra folder vừa restore: " + restoredFolder.path,
+                                                    ProgressTracker.LogLevel.INFO);
+                                            FolderReport subReport = checkFolder(restoredFolder, userEmail);
+                                            allReports.add(subReport);
+                                            pt.log("  ✅ Hoàn thành kiểm tra sâu: " + restoredFolder.path,
+                                                    ProgressTracker.LogLevel.SUCCESS);
+                                        } catch (Exception ex) {
+                                            pt.log("  ⚠️ Lỗi đệ quy checkFolder(" + fh.name + "): " + ex.getMessage(),
+                                                    ProgressTracker.LogLevel.WARNING);
+                                        }
+                                    }
+                                }
+                            }
+                        } catch (Exception e) {
+                            sfInfo.action = "Lỗi: " + e.getMessage();
+                            sfInfo.movedFrom = "-";
+                            pt.log("  │           │    ↳ ❌ Lỗi xử lý: " + e.getMessage(),
+                                    ProgressTracker.LogLevel.ERROR);
+                        }
+
                     } else {
-                        // ── THIẾU: cần tìm & move về ──
+                        // ── THIẾU: không ở direct child, không ở subtree → cần tìm & move về ──
                         missingFolderCount++;
                         sfInfo.status = "Thiếu";
                         pt.log("  │  ❌ Thiếu │  " + fh.name + "  →  đang tìm...", ProgressTracker.LogLevel.WARNING);
                         try {
                             MoveResult mr = findAndMoveFolderWithResult(fh, folder.id, folder.path, userEmail);
-                            sfInfo.action    = mr.success ? "Đã move" : "Không tìm thấy: " + mr.reason;
                             sfInfo.movedFrom = mr.movedFrom != null ? mr.movedFrom : "-";
 
-                            if (mr.success) {
-                                pt.log("  │           │    ↳ ✅ Move thành công từ: " + sfInfo.movedFrom, ProgressTracker.LogLevel.SUCCESS);
+                            if (mr.inTrash) {
+                                // ── TRONG THÙNG RÁC → chỉ báo cáo, KHÔNG move ──
+                                sfInfo.status = "Trong Thùng rác";
+                                sfInfo.action = "Đang trong Thùng rác — không tự động move";
+                                pt.log("  │           │    ↳ 🗑️  Folder trong TRASH — bỏ qua, không move",
+                                        ProgressTracker.LogLevel.WARNING);
+
+                            } else if (mr.success) {
+                                // ── MOVE THÀNH CÔNG ──
+                                sfInfo.action = "Đã move";
+                                pt.log("  │           │    ↳ ✅ Move thành công từ: " + sfInfo.movedFrom,
+                                        ProgressTracker.LogLevel.SUCCESS);
+
+                                // Đệ quy kiểm tra bên trong folder vừa restore
+                                if (mr.actuallyMoved && processedFolderIds.add(fh.id)) {
+                                    FolderInfo restoredFolder = new FolderInfo();
+                                    restoredFolder.id = fh.id;
+                                    restoredFolder.name = fh.name;
+                                    restoredFolder.path = folder.path + "/" + fh.name;
+                                    try {
+                                        pt.log("  🔄 Đệ quy kiểm tra folder vừa restore: " + restoredFolder.path,
+                                                ProgressTracker.LogLevel.INFO);
+                                        FolderReport subReport = checkFolder(restoredFolder, userEmail);
+                                        allReports.add(subReport);
+                                        pt.log("  ✅ Hoàn thành kiểm tra sâu: " + restoredFolder.path,
+                                                ProgressTracker.LogLevel.SUCCESS);
+                                    } catch (Exception ex) {
+                                        pt.log("  ⚠️ Lỗi đệ quy checkFolder(" + fh.name + "): " + ex.getMessage(),
+                                                ProgressTracker.LogLevel.WARNING);
+                                    }
+                                }
+
                             } else {
+                                // ── KHÔNG TÌM THẤY ──
+                                sfInfo.action = "Không tìm thấy: " + mr.reason;
                                 pt.log("  │           │    ↳ ⚠️  " + mr.reason, ProgressTracker.LogLevel.WARNING);
                             }
 
-                            // ĐỆ QUY: Folder vừa được move về → kiểm tra sâu bên trong
-                            if (mr.actuallyMoved && processedFolderIds.add(fh.id)) {
-                                FolderInfo restoredFolder = new FolderInfo();
-                                restoredFolder.id   = fh.id;
-                                restoredFolder.name = fh.name;
-                                restoredFolder.path = folder.path + "/" + fh.name;
-                                try {
-                                    pt.log("  🔄 Đệ quy kiểm tra folder vừa restore: " + restoredFolder.path, ProgressTracker.LogLevel.INFO);
-                                    FolderReport subReport = checkFolder(restoredFolder, userEmail);
-                                    allReports.add(subReport);
-                                    pt.log("  ✅ Hoàn thành kiểm tra sâu: " + restoredFolder.path, ProgressTracker.LogLevel.SUCCESS);
-                                } catch (Exception ex) {
-                                    pt.log("  ⚠️ Lỗi đệ quy checkFolder(" + fh.name + "): " + ex.getMessage(), ProgressTracker.LogLevel.WARNING);
-                                }
-                            }
                         } catch (Exception e) {
-                            sfInfo.action    = "Lỗi: " + e.getMessage();
+                            sfInfo.action = "Lỗi: " + e.getMessage();
                             sfInfo.movedFrom = "-";
                             pt.log("  │           │    ↳ ❌ Lỗi: " + e.getMessage(), ProgressTracker.LogLevel.ERROR);
                         }
@@ -445,9 +602,10 @@ public class DriveRecoveryService {
                 }
 
                 // ── In footer bảng + tổng kết ──
-                pt.log("  └─────────┴────────────────────────────────────────────────────", ProgressTracker.LogLevel.INFO);
-                pt.log(String.format("  📊 Folder tổng kết: %d tổng | ✅ %d có | ❌ %d thiếu",
-                        totalFolders, presentFolders, missingFolderCount),
+                pt.log("  └─────────┴────────────────────────────────────────────────────",
+                        ProgressTracker.LogLevel.INFO);
+                pt.log(String.format("  📊 Folder tổng kết: %d tổng | ✅ %d có | 📂 %d trong subfolder con | ❌ %d thiếu",
+                        totalFolders, presentFolders, inSubtreeCount, missingFolderCount),
                         missingFolderCount > 0 ? ProgressTracker.LogLevel.WARNING : ProgressTracker.LogLevel.SUCCESS);
             } else {
                 pt.log("  📁 Không có subfolder nào trong: " + folder.path, ProgressTracker.LogLevel.INFO);
@@ -500,30 +658,31 @@ public class DriveRecoveryService {
         Set<String> subfolderIds = getAllSubfolderIds(folder.id, userEmail);
         Set<String> filesInSubfolders = getAllFilesInSubfolders(subfolderIds, userEmail);
 
-        int totalFiles      = mergedFiles.size();
-        int presentFiles    = 0;
-        int inSubfolder     = 0;
-        int missingCount    = 0;
+        int totalFiles = mergedFiles.size();
+        int presentFiles = 0;
+        int inSubfolder = 0;
+        int missingCount = 0;
 
         // ── In header bảng file ──
         ptf.log("  ┌─────────────────────────────────────────────────────────────", ProgressTracker.LogLevel.INFO);
         ptf.log("  │ FILE SUMMARY  (activity: " + filesFromActivity.size() + ", drive hiện tại: " + currentFiles.size()
-                + ", tổng merged: " + totalFiles + ", trong subfolder: " + filesInSubfolders.size() + ")", ProgressTracker.LogLevel.INFO);
+                + ", tổng merged: " + totalFiles + ", trong subfolder: " + filesInSubfolders.size() + ")",
+                ProgressTracker.LogLevel.INFO);
         ptf.log("  ├──────────────────┬──────────────────────────────────────────", ProgressTracker.LogLevel.INFO);
         ptf.log("  │  Trạng thái      │  Tên File", ProgressTracker.LogLevel.INFO);
         ptf.log("  ├──────────────────┼──────────────────────────────────────────", ProgressTracker.LogLevel.INFO);
 
         for (FileHistory fileHistory : mergedFiles) {
             FileInfo fileInfo = new FileInfo();
-            fileInfo.fileName  = fileHistory.name;
-            fileInfo.fileId    = fileHistory.id;
-            fileInfo.lastSeen  = fileHistory.lastSeenTimestamp != null ? fileHistory.lastSeenTimestamp : "N/A";
+            fileInfo.fileName = fileHistory.name;
+            fileInfo.fileId = fileHistory.id;
+            fileInfo.lastSeen = fileHistory.lastSeenTimestamp != null ? fileHistory.lastSeenTimestamp : "N/A";
 
             // CASE 1: File đang có trong folder → bỏ qua (không cần gọi thêm API)
             if (currentFileIds.contains(fileHistory.id)) {
                 presentFiles++;
-                fileInfo.status    = "Có";
-                fileInfo.action    = "-";
+                fileInfo.status = "Có";
+                fileInfo.action = "-";
                 fileInfo.movedFrom = "-";
                 fileInfo.currentStatus = null; // File đang có → không cần query thêm
                 ptf.log("  │  ✅ Có            │  " + fileHistory.name, ProgressTracker.LogLevel.INFO);
@@ -534,8 +693,8 @@ public class DriveRecoveryService {
             // CASE 2: File đang trong subfolder → bỏ qua (không cần gọi thêm API)
             if (filesInSubfolders.contains(fileHistory.id)) {
                 inSubfolder++;
-                fileInfo.status    = "Trong subfolder";
-                fileInfo.action    = "Không cần move";
+                fileInfo.status = "Trong subfolder";
+                fileInfo.action = "Không cần move";
                 fileInfo.movedFrom = "-";
                 fileInfo.currentStatus = null; // Đang trong subfolder → không cần query thêm
                 ptf.log("  │  📂 Trong subfolder │  " + fileHistory.name + "  (bỏ qua)", ProgressTracker.LogLevel.INFO);
@@ -543,32 +702,159 @@ public class DriveRecoveryService {
                 continue;
             }
 
+            // CASE 2.5: File bị DELETE qua DELETE event — chưa confirm là direct child
+            // Logic: Trash → báo cáo; không Trash → move về; 404 → xóa vĩnh viễn
+            if (fileHistory.deletedFromSubtree && !fileHistory.everInFolder) {
+                missingCount++;
+                fileInfo.status = "Bị xóa";
+                ptf.log("  │  🗑️ DELETE event    │  " + fileHistory.name + "  →  đang verify...",
+                        ProgressTracker.LogLevel.WARNING);
+                try {
+                    com.google.api.services.drive.model.File deletedFile = null;
+                    boolean verifyFailed = false;
+                    try {
+                        deletedFile = driveService.files().get(fileHistory.id)
+                                .setFields("id, name, trashed, explicitlyTrashed, parents, owners")
+                                .setSupportsAllDrives(true)
+                                .execute();
+                    } catch (com.google.api.client.googleapis.json.GoogleJsonResponseException gje) {
+                        verifyFailed = true;
+                        if (gje.getStatusCode() == 404) {
+                            fileInfo.status = "Đã xóa vĩnh viễn";
+                            fileInfo.action = "Đã xóa vĩnh viễn khỏi Drive";
+                            fileInfo.movedFrom = "-";
+                            fileInfo.currentStatus = new CurrentStatus("DELETED", "❌ PERMANENTLY DELETED", "-", false);
+                            ptf.log("  │                  │    ↳ ❌ Đã xóa vĩnh viễn (404)",
+                                    ProgressTracker.LogLevel.WARNING);
+                        } else {
+                            fileInfo.action = "Lỗi verify: HTTP " + gje.getStatusCode();
+                            fileInfo.movedFrom = "-";
+                            fileInfo.currentStatus = getCurrentFileStatus(fileHistory.id);
+                            ptf.log("  │                  │    ↳ ⚠️  HTTP " + gje.getStatusCode(),
+                                    ProgressTracker.LogLevel.WARNING);
+                        }
+                    }
+
+                    if (!verifyFailed && deletedFile != null) {
+                        boolean inTrash = Boolean.TRUE.equals(deletedFile.getTrashed())
+                                || Boolean.TRUE.equals(deletedFile.getExplicitlyTrashed());
+
+                        if (inTrash) {
+                            // ── TRONG TRASH → chỉ báo cáo, KHÔNG move ──
+                            String ownerInfo = (deletedFile.getOwners() != null && !deletedFile.getOwners().isEmpty())
+                                    ? deletedFile.getOwners().get(0).getEmailAddress()
+                                    : "unknown";
+                            fileInfo.status = "Trong Thùng rác";
+                            fileInfo.action = "Đang trong Thùng rác — không tự động move";
+                            fileInfo.movedFrom = "Trash (owner: " + ownerInfo + ")";
+                            fileInfo.currentStatus = new CurrentStatus("TRASHED", "🗑️ IN TRASH",
+                                    "Trash (" + ownerInfo + ")", true);
+                            ptf.log("  │                  │    ↳ 🗑️  File trong TRASH của " + ownerInfo
+                                    + " — bỏ qua, không move", ProgressTracker.LogLevel.WARNING);
+                        } else {
+                            // ── KHÔNG TRONG TRASH → tồn tại, move về ──
+                            ptf.log("  │                  │    ↳ ✅ File vẫn tồn tại (không trong Trash) → đang move về...",
+                                    ProgressTracker.LogLevel.INFO);
+                            MoveResult mr = findAndMoveFileWithResult(fileHistory, folder.id, folder.path, userEmail,
+                                    subfolderIds);
+                            fileInfo.movedFrom = mr.movedFrom != null ? mr.movedFrom : "-";
+
+                            if (mr.inTrash) {
+                                fileInfo.status = "Trong Thùng rác";
+                                fileInfo.action = "Đang trong Thùng rác — không tự động move";
+                                fileInfo.currentStatus = new CurrentStatus("TRASHED", "🗑️ IN TRASH",
+                                        fileInfo.movedFrom, true);
+                                ptf.log("  │                  │    ↳ 🗑️  File trong TRASH — bỏ qua",
+                                        ProgressTracker.LogLevel.WARNING);
+                            } else if (mr.success) {
+                                fileInfo.status = "Đã move về";
+                                fileInfo.action = "Đã move";
+                                fileInfo.currentStatus = new CurrentStatus("MOVED", "✅ ĐÃ MOVE VỀ ĐÚNG CHỖ",
+                                        folder.path, false);
+                                ptf.log("  │                  │    ↳ ✅ Move thành công từ: " + fileInfo.movedFrom,
+                                        ProgressTracker.LogLevel.SUCCESS);
+                            } else {
+                                fileInfo.status = "Thiếu";
+                                fileInfo.action = "Không move được: " + mr.reason;
+                                fileInfo.currentStatus = getCurrentFileStatus(fileHistory.id);
+                                ptf.log("  │                  │    ↳ ⚠️  " + mr.reason,
+                                        ProgressTracker.LogLevel.WARNING);
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    fileInfo.action = "Lỗi: " + e.getMessage();
+                    fileInfo.movedFrom = "-";
+                    fileInfo.currentStatus = getCurrentFileStatus(fileHistory.id);
+                    ptf.log("  │                  │    ↳ ❌ Lỗi xử lý: " + e.getMessage(),
+                            ProgressTracker.LogLevel.ERROR);
+                }
+                report.files.add(fileInfo);
+                continue;
+            }
+
             // CASE 3: File thiếu → cần tìm & move
             missingCount++;
             fileInfo.status = "Thiếu";
-            ptf.log("  │  ❌ Thiếu         │  " + fileHistory.name + "  →  đang tìm...", ProgressTracker.LogLevel.WARNING);
+            ptf.log("  │  ❌ Thiếu         │  " + fileHistory.name + "  →  đang tìm...",
+                    ProgressTracker.LogLevel.WARNING);
+
+            // ⭐ FIX: File đã bị xóa vĩnh viễn (404 khi verify CREATE) →
+            // Không cần tìm kiếm trong Drive, ghi thẳng vào báo cáo.
+            if (fileHistory.permanentlyDeleted) {
+                ptf.log("  │                  │    ↳ ❌ File đã bị xóa vĩnh viễn khỏi toàn bộ Drive — đang tìm owner...",
+                        ProgressTracker.LogLevel.WARNING);
+                String ownerEmail = findOwnerViaReportsApi(fileHistory.id, Config.getAdminEmail());
+                String ownerInfo = (ownerEmail != null && !ownerEmail.isBlank())
+                        ? "Owner: " + ownerEmail
+                        : "Không xác định được owner";
+                fileInfo.action = "Không tìm thấy trong tổ chức (đã xóa vĩnh viễn)";
+                fileInfo.movedFrom = "-";
+                fileInfo.currentStatus = new CurrentStatus(
+                        "DELETED",
+                        "❌ PERMANENTLY DELETED",
+                        ownerInfo,
+                        false);
+                ptf.log("  │                  │         " + ownerInfo, ProgressTracker.LogLevel.DETAIL);
+                report.files.add(fileInfo);
+                continue;
+            }
 
             try {
-                MoveResult moveResult = findAndMoveFileWithResult(fileHistory, folder.id, folder.path, userEmail, subfolderIds);
-                if (moveResult.success) {
+                MoveResult moveResult = findAndMoveFileWithResult(fileHistory, folder.id, folder.path, userEmail,
+                        subfolderIds);
+
+                if (moveResult.inTrash) {
+                    // ── TRONG THÙNG RÁC → chỉ báo cáo, KHÔNG move ──
+                    fileInfo.status = "Trong Thùng rác";
+                    fileInfo.action = "Đang trong Thùng rác — không tự động move";
+                    fileInfo.movedFrom = moveResult.movedFrom != null ? moveResult.movedFrom : "Trash";
+                    fileInfo.currentStatus = new CurrentStatus("TRASHED", "🗑️ IN TRASH", fileInfo.movedFrom, true);
+                    ptf.log("  │                  │    ↳ 🗑️  File trong TRASH — bỏ qua",
+                            ProgressTracker.LogLevel.WARNING);
+
+                } else if (moveResult.success) {
+                    // ── MOVE THÀNH CÔNG ──
                     fileInfo.action = "Đã move";
-                    // File đã move thành công → ghi trạng thái rõ ràng, không cần query API thêm
                     fileInfo.currentStatus = new CurrentStatus("MOVED", "✅ ĐÃ MOVE VỀ ĐÚNG CHỖ",
                             folder.path, false);
-                    ptf.log("  │                  │    ↳ ✅ Move thành công từ: " + moveResult.movedFrom, ProgressTracker.LogLevel.SUCCESS);
+                    ptf.log("  │                  │    ↳ ✅ Move thành công từ: " + moveResult.movedFrom,
+                            ProgressTracker.LogLevel.SUCCESS);
+
                 } else {
-                    fileInfo.action = "Lỗi: " + moveResult.reason;
-                    // Move thất bại → gọi API để biết file đang ở trạng thái gì
-                    ptf.log("  │                  │    ↳ ⚠️  " + moveResult.reason + " — đang kiểm tra trạng thái file...", ProgressTracker.LogLevel.WARNING);
+                    // ── KHÔNG TÌM THẤY / LỖI → query trạng thái hiện tại ──
+                    fileInfo.action = "Không tìm thấy: " + moveResult.reason;
+                    ptf.log("  │                  │    ↳ ⚠️  " + moveResult.reason
+                            + " — đang kiểm tra trạng thái file...", ProgressTracker.LogLevel.WARNING);
                     fileInfo.currentStatus = getCurrentFileStatus(fileHistory.id);
                     ptf.log("  │                  │         Trạng thái: " + fileInfo.currentStatus.status
                             + " | Vị trí: " + fileInfo.currentStatus.location, ProgressTracker.LogLevel.DETAIL);
                 }
+
                 fileInfo.movedFrom = moveResult.movedFrom != null ? moveResult.movedFrom : "-";
             } catch (Exception e) {
-                fileInfo.action    = "Lỗi: " + e.getMessage();
+                fileInfo.action = "Lỗi: " + e.getMessage();
                 fileInfo.movedFrom = "-";
-                // Exception → cũng cố gọi getCurrentFileStatus để có thông tin
                 fileInfo.currentStatus = getCurrentFileStatus(fileHistory.id);
                 ptf.log("  │                  │    ↳ ❌ Lỗi xử lý: " + e.getMessage(), ProgressTracker.LogLevel.ERROR);
             }
@@ -669,13 +955,16 @@ public class DriveRecoveryService {
         File fileLocation = findFileById(file.id);
         if (fileLocation != null) {
             pt.log("    ✓ Tìm thấy file trong Drive của " + userEmail, ProgressTracker.LogLevel.INFO);
-            return handleFoundFile(file.id, fileLocation, userEmail, targetFolderId, targetFolderPath, subfolderIds, result, null);
+            return handleFoundFile(file.id, fileLocation, userEmail, targetFolderId, targetFolderPath, subfolderIds,
+                    result, null);
         }
 
         // ── Vòng 2: Reports API → tìm owner qua audit log toàn tổ chức ───────
-        // Giống Admin Console: tra cứu file ID trong Drive log events để biết owner là ai
+        // Giống Admin Console: tra cứu file ID trong Drive log events để biết owner là
+        // ai
         String adminEmail = Config.getAdminEmail();
-        pt.log("    🔍 Vòng 1 không thấy → hỏi Reports API tìm owner của file ID: " + file.id, ProgressTracker.LogLevel.DETAIL);
+        pt.log("    🔍 Vòng 1 không thấy → hỏi Reports API tìm owner của file ID: " + file.id,
+                ProgressTracker.LogLevel.DETAIL);
         String ownerEmail = findOwnerViaReportsApi(file.id, adminEmail);
         if (ownerEmail != null && !ownerEmail.isBlank()) {
             pt.log("    📋 Reports API → owner: " + ownerEmail, ProgressTracker.LogLevel.INFO);
@@ -686,12 +975,16 @@ public class DriveRecoveryService {
                             .setFields("id, name, parents, trashed, mimeType, owners, driveId")
                             .setSupportsAllDrives(true)
                             .execute();
-                    pt.log("    ✅ Tìm thấy qua owner (" + ownerEmail + "): " + fileLocation.getName(), ProgressTracker.LogLevel.SUCCESS);
-                    return handleFoundFile(file.id, fileLocation, userEmail, targetFolderId, targetFolderPath, subfolderIds, result, ownerEmail);
+                    pt.log("    ✅ Tìm thấy qua owner (" + ownerEmail + "): " + fileLocation.getName(),
+                            ProgressTracker.LogLevel.SUCCESS);
+                    return handleFoundFile(file.id, fileLocation, userEmail, targetFolderId, targetFolderPath,
+                            subfolderIds, result, ownerEmail);
                 } catch (com.google.api.client.googleapis.json.GoogleJsonResponseException e) {
-                    pt.log("    ⚠️  Owner " + ownerEmail + " không truy cập được (" + e.getStatusCode() + ")", ProgressTracker.LogLevel.WARNING);
+                    pt.log("    ⚠️  Owner " + ownerEmail + " không truy cập được (" + e.getStatusCode() + ")",
+                            ProgressTracker.LogLevel.WARNING);
                 } catch (Exception e) {
-                    pt.log("    ⚠️  Lỗi khi truy cập Drive của owner " + ownerEmail + ": " + e.getMessage(), ProgressTracker.LogLevel.WARNING);
+                    pt.log("    ⚠️  Lỗi khi truy cập Drive của owner " + ownerEmail + ": " + e.getMessage(),
+                            ProgressTracker.LogLevel.WARNING);
                     // ── Vòng 2b: invalid_grant / user không tồn tại trong domain ──
                     // Ví dụ: quydt@sappedu.enterprise.io.vn → tìm quydt@* trong tổ chức
                     String msg = e.getMessage() != null ? e.getMessage() : "";
@@ -702,13 +995,15 @@ public class DriveRecoveryService {
                                 ? ownerEmail.substring(0, ownerEmail.indexOf('@'))
                                 : "";
                         if (!username.isBlank()) {
-                            pt.log("    🔄 Vòng 2b: tìm user có username '" + username + "' trong tổ chức...", ProgressTracker.LogLevel.DETAIL);
+                            pt.log("    🔄 Vòng 2b: tìm user có username '" + username + "' trong tổ chức...",
+                                    ProgressTracker.LogLevel.DETAIL);
                             List<String> sameUsernameList = Config.getAllUsersForSearch().stream()
                                     .filter(u -> u != null && u.startsWith(username + "@")
                                             && !u.equalsIgnoreCase(ownerEmail))
                                     .collect(java.util.stream.Collectors.toList());
                             if (sameUsernameList.isEmpty()) {
-                                pt.log("    ℹ️  Không tìm thấy user nào có username '" + username + "' trong tổ chức", ProgressTracker.LogLevel.DETAIL);
+                                pt.log("    ℹ️  Không tìm thấy user nào có username '" + username + "' trong tổ chức",
+                                        ProgressTracker.LogLevel.DETAIL);
                             }
                             for (String altEmail : sameUsernameList) {
                                 pt.log("    🔄 Vòng 2b: thử " + altEmail, ProgressTracker.LogLevel.DETAIL);
@@ -718,8 +1013,10 @@ public class DriveRecoveryService {
                                             .setFields("id, name, parents, trashed, mimeType, owners, driveId")
                                             .setSupportsAllDrives(true)
                                             .execute();
-                                    pt.log("    ✅ Tìm thấy qua " + altEmail + ": " + fileLocation.getName(), ProgressTracker.LogLevel.SUCCESS);
-                                    return handleFoundFile(file.id, fileLocation, userEmail, targetFolderId, targetFolderPath, subfolderIds, result, altEmail);
+                                    pt.log("    ✅ Tìm thấy qua " + altEmail + ": " + fileLocation.getName(),
+                                            ProgressTracker.LogLevel.SUCCESS);
+                                    return handleFoundFile(file.id, fileLocation, userEmail, targetFolderId,
+                                            targetFolderPath, subfolderIds, result, altEmail);
                                 } catch (Exception altEx) {
                                     pt.log("    ⬝ " + altEmail + " không có file này", ProgressTracker.LogLevel.DETAIL);
                                 }
@@ -728,18 +1025,23 @@ public class DriveRecoveryService {
                     }
                 }
             } else {
-                pt.log("    ℹ️  Owner trùng với user hiện tại → file đã bị xóa khỏi Drive", ProgressTracker.LogLevel.DETAIL);
+                pt.log("    ℹ️  Owner trùng với user hiện tại → file đã bị xóa khỏi Drive",
+                        ProgressTracker.LogLevel.DETAIL);
             }
         } else {
-            pt.log("    ⚠️  Reports API không có log cho file này → không xác định được owner", ProgressTracker.LogLevel.WARNING);
+            pt.log("    ⚠️  Reports API không có log cho file này → không xác định được owner",
+                    ProgressTracker.LogLevel.WARNING);
         }
 
-        // ── Vòng 3: Quét toàn bộ allUsersForSearch (giống findAndMoveFolderWithResult) ──
+        // ── Vòng 3: Quét toàn bộ allUsersForSearch (giống findAndMoveFolderWithResult)
+        // ──
         List<String> allUsers = Config.getAllUsersForSearch();
         if (!allUsers.isEmpty()) {
-            pt.log("    🔍 Vòng 3: Quét toàn bộ " + allUsers.size() + " users trong tổ chức...", ProgressTracker.LogLevel.DETAIL);
+            pt.log("    🔍 Vòng 3: Quét toàn bộ " + allUsers.size() + " users trong tổ chức...",
+                    ProgressTracker.LogLevel.DETAIL);
             for (String otherUserEmail : allUsers) {
-                if (otherUserEmail.equals(userEmail)) continue;
+                if (otherUserEmail.equals(userEmail))
+                    continue;
                 try {
                     Drive userDriveService = createDriveServiceForUserWithRetry(otherUserEmail);
                     try {
@@ -748,26 +1050,31 @@ public class DriveRecoveryService {
                                 .setSupportsAllDrives(true)
                                 .execute();
                         if (candidate != null) {
-                            pt.log("    ✓ Vòng 3 tìm thấy trong Drive của: " + otherUserEmail, ProgressTracker.LogLevel.INFO);
-                            return handleFoundFile(file.id, candidate, userEmail, targetFolderId, targetFolderPath, subfolderIds, result, otherUserEmail);
+                            pt.log("    ✓ Vòng 3 tìm thấy trong Drive của: " + otherUserEmail,
+                                    ProgressTracker.LogLevel.INFO);
+                            return handleFoundFile(file.id, candidate, userEmail, targetFolderId, targetFolderPath,
+                                    subfolderIds, result, otherUserEmail);
                         }
                     } catch (com.google.api.client.googleapis.json.GoogleJsonResponseException gje) {
                         int sc = gje.getStatusCode();
                         if (sc == 404 || sc == 403) {
                             // Không có → tiếp tục
                         } else {
-                            pt.log("    ⚠️  Vòng 3 [" + otherUserEmail + "] HTTP " + sc, ProgressTracker.LogLevel.DETAIL);
+                            pt.log("    ⚠️  Vòng 3 [" + otherUserEmail + "] HTTP " + sc,
+                                    ProgressTracker.LogLevel.DETAIL);
                         }
                     }
                 } catch (Exception e) {
                     // invalid_grant hoặc lỗi khác → bỏ qua, tiếp tục user tiếp theo
                     String em = e.getMessage() != null ? e.getMessage() : "";
                     if (!em.contains("invalid_grant") && !em.contains("Invalid email")) {
-                        pt.log("    ⚠️  Vòng 3 [" + otherUserEmail + "] lỗi: " + e.getClass().getSimpleName(), ProgressTracker.LogLevel.DETAIL);
+                        pt.log("    ⚠️  Vòng 3 [" + otherUserEmail + "] lỗi: " + e.getClass().getSimpleName(),
+                                ProgressTracker.LogLevel.DETAIL);
                     }
                 }
             }
-            pt.log("    ❌ Vòng 3: Đã quét " + allUsers.size() + " users — không tìm thấy file", ProgressTracker.LogLevel.WARNING);
+            pt.log("    ❌ Vòng 3: Đã quét " + allUsers.size() + " users — không tìm thấy file",
+                    ProgressTracker.LogLevel.WARNING);
         }
 
         result.reason = "Không tìm thấy file sau 3 vòng tìm kiếm"
@@ -776,20 +1083,33 @@ public class DriveRecoveryService {
         return result;
     }
 
-
-
     private MoveResult handleFoundFile(String fileId, File fileLocation, String userEmail,
-            String targetFolderId, String targetFolderPath, Set<String> subfolderIds, MoveResult result, String finderEmail) {
+            String targetFolderId, String targetFolderPath, Set<String> subfolderIds, MoveResult result,
+            String finderEmail) {
 
         ProgressTracker pt = ProgressTracker.getInstance();
 
-        // ── Trong Trash → bỏ qua ───────────────────────────────────────────────
+        // ── Cross-user registry: đã recover ở user khác → bỏ qua ─────────────
+        // Ngăn vòng lặp: UserA recover file X về folderA → UserB thấy X "Thiếu"
+        // trong folderB → định move X từ folderA sang folderB (undo recovery của A).
+        if (globalRecoveredIds.contains(fileId)) {
+            result.success = true;
+            result.reason = "Đã recover ở user khác (cross-user registry) — bỏ qua";
+            result.movedFrom = "-";
+            pt.log("    ⏭️  File ID đã có trong cross-user registry → không move lại", ProgressTracker.LogLevel.DETAIL);
+            return result;
+        }
+
+        // ── Trong Trash → KHÔNG move, chỉ báo cáo ─────────────────────────────
         if (fileLocation.getTrashed() != null && fileLocation.getTrashed()) {
             String ownerInfo = (fileLocation.getOwners() != null && !fileLocation.getOwners().isEmpty())
-                    ? fileLocation.getOwners().get(0).getEmailAddress() : userEmail;
+                    ? fileLocation.getOwners().get(0).getEmailAddress()
+                    : userEmail;
+            result.inTrash = true; // ← signal cho caller
             result.reason = "File đang trong TRASH của " + ownerInfo;
             result.movedFrom = "Trash (" + ownerInfo + ")";
-            pt.log("    🗑️  File trong TRASH của: " + ownerInfo, ProgressTracker.LogLevel.WARNING);
+            pt.log("    🗑️  File trong TRASH của: " + ownerInfo + " — bỏ qua, không move",
+                    ProgressTracker.LogLevel.WARNING);
             return result;
         }
 
@@ -810,8 +1130,56 @@ public class DriveRecoveryService {
             }
         }
 
+        // ── Sibling check: file đang trong folder là SIBLING của target → bỏ qua ──
+        // Tình huống: file F trong folder C, C là sibling của target B (cùng parent A).
+        // Activity API trả về stale history → code tìm F, thấy F trong C → định move
+        // sang B.
+        // Nếu C và B cùng parent A → F thuộc về C hợp lệ, KHÔNG move.
+        //
+        // A ─┬─ B (targetFolder) ← đang xử lý
+        // └─ C (fileLocation.parent) ← F đang ở đây
+        // └─ F (file)
+        //
+        if (fileLocation.getParents() != null) {
+            try {
+                File targetFolderMeta = driveService.files().get(targetFolderId)
+                        .setFields("parents")
+                        .setSupportsAllDrives(true)
+                        .execute();
+                if (targetFolderMeta.getParents() != null) {
+                    for (String fileParentId : fileLocation.getParents()) {
+                        if (fileParentId.equals(targetFolderId))
+                            continue; // đã check ở trên
+                        if (subfolderIds.contains(fileParentId))
+                            continue; // đã check ở trên
+                        // Lấy parent của folder chứa file → so sánh với parent của target
+                        try {
+                            File fileParentMeta = driveService.files().get(fileParentId)
+                                    .setFields("parents")
+                                    .setSupportsAllDrives(true)
+                                    .execute();
+                            if (fileParentMeta.getParents() != null &&
+                                    fileParentMeta.getParents().stream()
+                                            .anyMatch(p -> targetFolderMeta.getParents().contains(p))) {
+                                result.reason = "File trong SIBLING folder của target — không move";
+                                result.movedFrom = "-";
+                                pt.log("    ⏭️  File trong sibling folder → bỏ qua, không move vào target",
+                                        ProgressTracker.LogLevel.DETAIL);
+                                return result;
+                            }
+                        } catch (Exception ignored) {
+                            // Không lấy được parent folder → bỏ qua check này, tiếp tục move
+                        }
+                    }
+                }
+            } catch (Exception ex) {
+                pt.log("    ⚠️  Không check được sibling file: " + ex.getMessage(), ProgressTracker.LogLevel.DETAIL);
+            }
+        }
+
         String ownerEmail = (fileLocation.getOwners() != null && !fileLocation.getOwners().isEmpty())
-                ? fileLocation.getOwners().get(0).getEmailAddress() : userEmail;
+                ? fileLocation.getOwners().get(0).getEmailAddress()
+                : userEmail;
 
         // ── Lấy parents (re-fetch nếu null do impersonation limit) ──────────────
         List<String> resolvedParents = fileLocation.getParents();
@@ -840,7 +1208,8 @@ public class DriveRecoveryService {
 
         String parentName = getParentFolderName(fileLocation);
         result.movedFrom = "📁 " + parentName + " | Drive của: " + ownerEmail;
-        pt.log("    📂 File tại: '" + parentName + "' (" + ownerEmail + ") → Move về: " + targetFolderPath, ProgressTracker.LogLevel.INFO);
+        pt.log("    📂 File tại: '" + parentName + "' (" + ownerEmail + ") → Move về: " + targetFolderPath,
+                ProgressTracker.LogLevel.INFO);
 
         // ── Thứ tự thử: finder → owner → admin → target user ───────────────────
         java.util.LinkedHashMap<String, String> candidates = new java.util.LinkedHashMap<>();
@@ -869,14 +1238,19 @@ public class DriveRecoveryService {
                     result.success = true;
                     result.actuallyMoved = true;
                     result.reason = "Success (via " + role + ": " + candidateEmail + ")";
-                    pt.log("    ✅ Move FILE OK via " + role + " (" + candidateEmail + "): " + targetFolderPath, ProgressTracker.LogLevel.SUCCESS);
+                    // ⭐ Đăng ký vào cross-user registry: ngăn user khác move FILE này lại
+                    globalRecoveredIds.add(fileId);
+                    pt.log("    ✅ Move FILE OK via " + role + " (" + candidateEmail + "): " + targetFolderPath,
+                            ProgressTracker.LogLevel.SUCCESS);
                     return result;
                 }
                 lastReason = mr.reason;
-                pt.log("    ⚠️  " + role + " (" + candidateEmail + ") thất bại: " + mr.reason, ProgressTracker.LogLevel.DETAIL);
+                pt.log("    ⚠️  " + role + " (" + candidateEmail + ") thất bại: " + mr.reason,
+                        ProgressTracker.LogLevel.DETAIL);
             } catch (Exception e) {
                 lastReason = e.getMessage();
-                pt.log("    ⚠️  " + role + " (" + candidateEmail + ") exception: " + e.getMessage(), ProgressTracker.LogLevel.DETAIL);
+                pt.log("    ⚠️  " + role + " (" + candidateEmail + ") exception: " + e.getMessage(),
+                        ProgressTracker.LogLevel.DETAIL);
             }
         }
 
@@ -885,14 +1259,16 @@ public class DriveRecoveryService {
         // nhưng userEmail (chủ targetFolder) có thể grant permission cho họ.
         String grantTarget = (finderEmail != null && !finderEmail.isBlank()) ? finderEmail : ownerEmail;
         if (grantTarget != null && !grantTarget.equals(userEmail)) {
-            pt.log("    🔑 Thử grant write tạm thời cho " + grantTarget + " trên targetFolder...", ProgressTracker.LogLevel.DETAIL);
+            pt.log("    🔑 Thử grant write tạm thời cho " + grantTarget + " trên targetFolder...",
+                    ProgressTracker.LogLevel.DETAIL);
             MoveResult tempResult = tryMoveWithTemporaryShare(
                     fileId, resolvedParents, targetFolderId, grantTarget, userEmail);
             if (tempResult.success) {
                 result.success = true;
                 result.actuallyMoved = true;
                 result.reason = tempResult.reason;
-                pt.log("    ✅ Move FILE OK via temporary share → " + targetFolderPath, ProgressTracker.LogLevel.SUCCESS);
+                pt.log("    ✅ Move FILE OK via temporary share → " + targetFolderPath,
+                        ProgressTracker.LogLevel.SUCCESS);
                 return result;
             }
             lastReason = tempResult.reason;
@@ -901,8 +1277,6 @@ public class DriveRecoveryService {
         result.reason = "Move thất bại: " + lastReason;
         return result;
     }
-
-
 
     // ============================================
     // FOLDER RECOVERY METHODS
@@ -933,12 +1307,14 @@ public class DriveRecoveryService {
         File foundFolder = findFolderById(folderHistory.id, driveService);
         if (foundFolder != null) {
             pt.log("    ✓ Tìm thấy folder trong Drive của " + userEmail, ProgressTracker.LogLevel.INFO);
-            return handleFoundFolder(folderHistory.id, foundFolder, userEmail, targetFolderId, targetFolderPath, result, null);
+            return handleFoundFolder(folderHistory.id, foundFolder, userEmail, targetFolderId, targetFolderPath, result,
+                    null);
         }
 
         // ── Vòng 2: Reports API → tìm owner qua audit log toàn tổ chức ───────
         String adminEmail = Config.getAdminEmail();
-        pt.log("    🔍 Vòng 1 không thấy → hỏi Reports API tìm owner của folder ID: " + folderHistory.id, ProgressTracker.LogLevel.DETAIL);
+        pt.log("    🔍 Vòng 1 không thấy → hỏi Reports API tìm owner của folder ID: " + folderHistory.id,
+                ProgressTracker.LogLevel.DETAIL);
         String ownerEmail = findOwnerViaReportsApi(folderHistory.id, adminEmail);
         if (ownerEmail != null && !ownerEmail.isBlank()) {
             pt.log("    📋 Reports API → owner: " + ownerEmail, ProgressTracker.LogLevel.INFO);
@@ -949,15 +1325,20 @@ public class DriveRecoveryService {
                             .setFields("id, name, parents, trashed, mimeType, owners, driveId")
                             .setSupportsAllDrives(true)
                             .execute();
-                    pt.log("    ✅ Tìm thấy qua owner (" + ownerEmail + "): " + foundFolder.getName(), ProgressTracker.LogLevel.SUCCESS);
-                    return handleFoundFolder(folderHistory.id, foundFolder, userEmail, targetFolderId, targetFolderPath, result, ownerEmail);
+                    pt.log("    ✅ Tìm thấy qua owner (" + ownerEmail + "): " + foundFolder.getName(),
+                            ProgressTracker.LogLevel.SUCCESS);
+                    return handleFoundFolder(folderHistory.id, foundFolder, userEmail, targetFolderId, targetFolderPath,
+                            result, ownerEmail);
                 } catch (com.google.api.client.googleapis.json.GoogleJsonResponseException e) {
-                    pt.log("    ⚠️  Owner " + ownerEmail + " không truy cập được (" + e.getStatusCode() + ")", ProgressTracker.LogLevel.WARNING);
+                    pt.log("    ⚠️  Owner " + ownerEmail + " không truy cập được (" + e.getStatusCode() + ")",
+                            ProgressTracker.LogLevel.WARNING);
                 } catch (Exception e) {
-                    pt.log("    ⚠️  Lỗi khi truy cập Drive của owner " + ownerEmail + ": " + e.getMessage(), ProgressTracker.LogLevel.WARNING);
+                    pt.log("    ⚠️  Lỗi khi truy cập Drive của owner " + ownerEmail + ": " + e.getMessage(),
+                            ProgressTracker.LogLevel.WARNING);
                     // ── Vòng 2b: invalid_grant / user không tồn tại trong domain ──
                     // Tìm trong allUsersForSearch user nào có cùng username
-                    // Ví dụ: tramhb@sappedu.enterprise.io.vn → tìm tramhb@* trong tổ chức → tramhb@sapp.edu.vn
+                    // Ví dụ: tramhb@sappedu.enterprise.io.vn → tìm tramhb@* trong tổ chức →
+                    // tramhb@sapp.edu.vn
                     String msg = e.getMessage() != null ? e.getMessage() : "";
                     boolean isInvalidUser = msg.contains("invalid_grant") || msg.contains("Invalid email")
                             || msg.contains("User ID") || msg.contains("400");
@@ -966,13 +1347,15 @@ public class DriveRecoveryService {
                                 ? ownerEmail.substring(0, ownerEmail.indexOf('@'))
                                 : "";
                         if (!username.isBlank()) {
-                            pt.log("    🔄 Vòng 2b: tìm user có username '" + username + "' trong tổ chức...", ProgressTracker.LogLevel.DETAIL);
+                            pt.log("    🔄 Vòng 2b: tìm user có username '" + username + "' trong tổ chức...",
+                                    ProgressTracker.LogLevel.DETAIL);
                             List<String> sameUsernameList = Config.getAllUsersForSearch().stream()
                                     .filter(u -> u != null && u.startsWith(username + "@")
                                             && !u.equalsIgnoreCase(ownerEmail))
                                     .collect(java.util.stream.Collectors.toList());
                             if (sameUsernameList.isEmpty()) {
-                                pt.log("    ℹ️  Không tìm thấy user nào có username '" + username + "' trong tổ chức", ProgressTracker.LogLevel.DETAIL);
+                                pt.log("    ℹ️  Không tìm thấy user nào có username '" + username + "' trong tổ chức",
+                                        ProgressTracker.LogLevel.DETAIL);
                             }
                             for (String altEmail : sameUsernameList) {
                                 pt.log("    🔄 Vòng 2b: thử " + altEmail, ProgressTracker.LogLevel.DETAIL);
@@ -982,28 +1365,35 @@ public class DriveRecoveryService {
                                             .setFields("id, name, parents, trashed, mimeType, owners, driveId")
                                             .setSupportsAllDrives(true)
                                             .execute();
-                                    pt.log("    ✅ Tìm thấy qua " + altEmail + ": " + foundFolder.getName(), ProgressTracker.LogLevel.SUCCESS);
-                                    return handleFoundFolder(folderHistory.id, foundFolder, userEmail, targetFolderId, targetFolderPath, result, altEmail);
+                                    pt.log("    ✅ Tìm thấy qua " + altEmail + ": " + foundFolder.getName(),
+                                            ProgressTracker.LogLevel.SUCCESS);
+                                    return handleFoundFolder(folderHistory.id, foundFolder, userEmail, targetFolderId,
+                                            targetFolderPath, result, altEmail);
                                 } catch (Exception altEx) {
-                                    pt.log("    ⬝ " + altEmail + " không có folder này", ProgressTracker.LogLevel.DETAIL);
+                                    pt.log("    ⬝ " + altEmail + " không có folder này",
+                                            ProgressTracker.LogLevel.DETAIL);
                                 }
                             }
                         }
                     }
                 }
             } else {
-                pt.log("    ℹ️  Owner trùng với user hiện tại → folder đã bị xóa khỏi Drive", ProgressTracker.LogLevel.DETAIL);
+                pt.log("    ℹ️  Owner trùng với user hiện tại → folder đã bị xóa khỏi Drive",
+                        ProgressTracker.LogLevel.DETAIL);
             }
         } else {
-            pt.log("    ⚠️  Reports API không có log cho folder này → không xác định được owner", ProgressTracker.LogLevel.WARNING);
+            pt.log("    ⚠️  Reports API không có log cho folder này → không xác định được owner",
+                    ProgressTracker.LogLevel.WARNING);
         }
 
         // ── Vòng 3: Quét toàn bộ allUsersForSearch (giống code cũ) ───────────
         List<String> allUsers = Config.getAllUsersForSearch();
         if (!allUsers.isEmpty()) {
-            pt.log("    🔍 Vòng 3: Quét toàn bộ " + allUsers.size() + " users trong tổ chức...", ProgressTracker.LogLevel.DETAIL);
+            pt.log("    🔍 Vòng 3: Quét toàn bộ " + allUsers.size() + " users trong tổ chức...",
+                    ProgressTracker.LogLevel.DETAIL);
             for (String otherUserEmail : allUsers) {
-                if (otherUserEmail.equals(userEmail)) continue;
+                if (otherUserEmail.equals(userEmail))
+                    continue;
                 try {
                     Drive userDriveService = createDriveServiceForUserWithRetry(otherUserEmail);
                     try {
@@ -1012,26 +1402,31 @@ public class DriveRecoveryService {
                                 .setSupportsAllDrives(true)
                                 .execute();
                         if (candidate != null) {
-                            pt.log("    ✓ Vòng 3 tìm thấy trong Drive của: " + otherUserEmail, ProgressTracker.LogLevel.INFO);
-                            return handleFoundFolder(folderHistory.id, candidate, userEmail, targetFolderId, targetFolderPath, result, otherUserEmail);
+                            pt.log("    ✓ Vòng 3 tìm thấy trong Drive của: " + otherUserEmail,
+                                    ProgressTracker.LogLevel.INFO);
+                            return handleFoundFolder(folderHistory.id, candidate, userEmail, targetFolderId,
+                                    targetFolderPath, result, otherUserEmail);
                         }
                     } catch (com.google.api.client.googleapis.json.GoogleJsonResponseException gje) {
                         int sc = gje.getStatusCode();
                         if (sc == 404 || sc == 403) {
                             // Không có → tiếp tục
                         } else {
-                            pt.log("    ⚠️  Vòng 3 [" + otherUserEmail + "] HTTP " + sc, ProgressTracker.LogLevel.DETAIL);
+                            pt.log("    ⚠️  Vòng 3 [" + otherUserEmail + "] HTTP " + sc,
+                                    ProgressTracker.LogLevel.DETAIL);
                         }
                     }
                 } catch (Exception e) {
                     // invalid_grant hoặc lỗi khác → bỏ qua, tiếp tục user tiếp theo
                     String em = e.getMessage() != null ? e.getMessage() : "";
                     if (!em.contains("invalid_grant") && !em.contains("Invalid email")) {
-                        pt.log("    ⚠️  Vòng 3 [" + otherUserEmail + "] lỗi: " + e.getClass().getSimpleName(), ProgressTracker.LogLevel.DETAIL);
+                        pt.log("    ⚠️  Vòng 3 [" + otherUserEmail + "] lỗi: " + e.getClass().getSimpleName(),
+                                ProgressTracker.LogLevel.DETAIL);
                     }
                 }
             }
-            pt.log("    ❌ Vòng 3: Đã quét " + allUsers.size() + " users — không tìm thấy folder", ProgressTracker.LogLevel.WARNING);
+            pt.log("    ❌ Vòng 3: Đã quét " + allUsers.size() + " users — không tìm thấy folder",
+                    ProgressTracker.LogLevel.WARNING);
         }
 
         result.reason = "Không tìm thấy folder sau 3 vòng tìm kiếm"
@@ -1043,18 +1438,21 @@ public class DriveRecoveryService {
     /**
      * Tạo danh sách email thay thế bằng cách đổi domain của ownerEmail
      * sang tất cả domain của các user trong allUsersForSearch.
-     * Không còn dùng trực tiếp — logic này đã được thay bằng username-prefix search trong vòng 2b.
+     * Không còn dùng trực tiếp — logic này đã được thay bằng username-prefix search
+     * trong vòng 2b.
      * Giữ lại để tương thích nếu cần dùng lại.
      */
     private List<String> buildAlternateDomainEmails(String ownerEmail, List<String> allUsers) {
         List<String> result = new ArrayList<>();
-        if (ownerEmail == null || !ownerEmail.contains("@")) return result;
+        if (ownerEmail == null || !ownerEmail.contains("@"))
+            return result;
         String username = ownerEmail.substring(0, ownerEmail.indexOf('@'));
         Set<String> knownDomains = new LinkedHashSet<>();
         for (String u : allUsers) {
             if (u != null && u.contains("@")) {
                 String domain = u.substring(u.indexOf('@') + 1);
-                if (!domain.isEmpty()) knownDomains.add(domain);
+                if (!domain.isEmpty())
+                    knownDomains.add(domain);
             }
         }
         String originalDomain = ownerEmail.substring(ownerEmail.indexOf('@') + 1);
@@ -1066,19 +1464,33 @@ public class DriveRecoveryService {
         return result;
     }
 
-
     private MoveResult handleFoundFolder(String folderId, File foundFolder, String userEmail,
             String targetFolderId, String targetFolderPath, MoveResult result, String finderEmail) {
 
         ProgressTracker pt = ProgressTracker.getInstance();
 
-        // ── Trong Trash → bỏ qua ───────────────────────────────────────────────
+        // ── Cross-user registry: đã recover ở user khác → bỏ qua ─────────────
+        // Ngăn vòng lặp: UserA recover X về folderA → UserB thấy X "Thiếu" trong
+        // folderB → định move X từ folderA sang folderB (undo recovery của A).
+        if (globalRecoveredIds.contains(folderId)) {
+            result.success = true;
+            result.reason = "Đã recover ở user khác (cross-user registry) — bỏ qua";
+            result.movedFrom = "-";
+            pt.log("    ⏭️  Folder ID đã có trong cross-user registry → không move lại",
+                    ProgressTracker.LogLevel.DETAIL);
+            return result;
+        }
+
+        // ── Trong Trash → KHÔNG move, chỉ báo cáo ─────────────────────────────
         if (foundFolder.getTrashed() != null && foundFolder.getTrashed()) {
             String ownerInfo = (foundFolder.getOwners() != null && !foundFolder.getOwners().isEmpty())
-                    ? foundFolder.getOwners().get(0).getEmailAddress() : userEmail;
+                    ? foundFolder.getOwners().get(0).getEmailAddress()
+                    : userEmail;
+            result.inTrash = true; // ← signal cho caller
             result.reason = "Folder đang trong TRASH của " + ownerInfo;
             result.movedFrom = "Trash (" + ownerInfo + ")";
-            pt.log("    🗑️  Folder trong TRASH của: " + ownerInfo, ProgressTracker.LogLevel.WARNING);
+            pt.log("    🗑️  Folder trong TRASH của: " + ownerInfo + " — bỏ qua, không move",
+                    ProgressTracker.LogLevel.WARNING);
             return result;
         }
 
@@ -1091,8 +1503,67 @@ public class DriveRecoveryService {
             return result;
         }
 
+        // ── Đang là grandchild (nằm sâu trong subtree của target) → bỏ qua ────
+        // Tương tự handleFoundFile: kiểm tra parent có phải subfolder của target không.
+        // Tình huống: folder X từng là direct child của B, sau đó được move vào C
+        // (C là subfolder của B). Activity cũ vẫn báo X thiếu trong B, nhưng thực ra
+        // X đang ở đúng chỗ — chỉ sâu hơn 1 cấp. KHÔNG move X từ C lên thẳng B.
+        if (foundFolder.getParents() != null) {
+            try {
+                Set<String> descendantIds = getAllSubfolderIds(targetFolderId, userEmail);
+                if (foundFolder.getParents().stream().anyMatch(descendantIds::contains)) {
+                    result.success = true;
+                    result.reason = "Đang trong subfolder con của target (grandchild) — không cần move";
+                    result.movedFrom = targetFolderPath + " (subfolder con)";
+                    pt.log("    ⏭️  Folder đang là grandchild của target → bỏ qua, không move",
+                            ProgressTracker.LogLevel.DETAIL);
+                    return result;
+                }
+            } catch (Exception ex) {
+                pt.log("    ⚠️  Không kiểm tra được subtree: " + ex.getMessage(), ProgressTracker.LogLevel.DETAIL);
+                // Nếu không check được → tiếp tục logic move bình thường (tránh bỏ sót)
+            }
+        }
+
+        // ── Sibling check: foundFolder và targetFolder cùng parent → KHÔNG move ──
+        // Root cause: setAncestorName() trả về TOÀN BỘ history, kể cả khi folder C
+        // chỉ đi qua B tạm thời (transit). Code tìm C đang ở A, B cũng ở A → C là
+        // SIBLING của B chứ không phải bị mất khỏi B. KHÔNG được move C vào B.
+        //
+        // Ví dụ:
+        // A ─┬─ B (targetFolder) ← đang xử lý
+        // └─ C (foundFolder) ← Activity cũ báo C từng ở trong B (sai)
+        //
+        // C.parents = [A], targetFolder.parents = [A] → cùng parent A → siblings → bỏ
+        // qua.
+        if (foundFolder.getParents() != null) {
+            try {
+                File targetFolderMeta = driveService.files().get(targetFolderId)
+                        .setFields("parents")
+                        .setSupportsAllDrives(true)
+                        .execute();
+                if (targetFolderMeta.getParents() != null) {
+                    boolean areSiblings = foundFolder.getParents().stream()
+                            .anyMatch(p -> targetFolderMeta.getParents().contains(p));
+                    if (areSiblings) {
+                        result.success = true;
+                        result.reason = "Folder là SIBLING của target (cùng parent) — không move vào target";
+                        result.movedFrom = "-";
+                        pt.log("    ⏭️  Folder là SIBLING của target → bỏ qua, không move C vào B",
+                                ProgressTracker.LogLevel.DETAIL);
+                        return result;
+                    }
+                }
+            } catch (Exception ex) {
+                pt.log("    ⚠️  Không kiểm tra được sibling relationship: " + ex.getMessage(),
+                        ProgressTracker.LogLevel.DETAIL);
+                // Không check được → tiếp tục (tránh bỏ sót file thực sự cần move)
+            }
+        }
+
         String ownerEmail = (foundFolder.getOwners() != null && !foundFolder.getOwners().isEmpty())
-                ? foundFolder.getOwners().get(0).getEmailAddress() : userEmail;
+                ? foundFolder.getOwners().get(0).getEmailAddress()
+                : userEmail;
 
         // ── Lấy parents (re-fetch nếu null do impersonation limit) ──────────────
         List<String> resolvedParents = foundFolder.getParents();
@@ -1120,7 +1591,8 @@ public class DriveRecoveryService {
 
         String parentName = getParentFolderName(foundFolder);
         result.movedFrom = "📁 " + parentName + " | Drive của: " + ownerEmail;
-        pt.log("    📂 Folder tại: '" + parentName + "' (" + ownerEmail + ") → Move về: " + targetFolderPath, ProgressTracker.LogLevel.INFO);
+        pt.log("    📂 Folder tại: '" + parentName + "' (" + ownerEmail + ") → Move về: " + targetFolderPath,
+                ProgressTracker.LogLevel.INFO);
 
         // ── Thứ tự thử: finder → owner → admin → target user ───────────────────
         java.util.LinkedHashMap<String, String> candidates = new java.util.LinkedHashMap<>();
@@ -1149,28 +1621,35 @@ public class DriveRecoveryService {
                     result.success = true;
                     result.actuallyMoved = true;
                     result.reason = "Success (via " + role + ": " + candidateEmail + ")";
-                    pt.log("    ✅ Move FOLDER OK via " + role + " (" + candidateEmail + "): " + targetFolderPath, ProgressTracker.LogLevel.SUCCESS);
+                    pt.log("    ✅ Move FOLDER OK via " + role + " (" + candidateEmail + "): " + targetFolderPath,
+                            ProgressTracker.LogLevel.SUCCESS);
+                    // ⭐ Đăng ký vào cross-user registry: ngăn user khác move lại
+                    globalRecoveredIds.add(folderId);
                     return result;
                 }
                 lastReason = mr.reason;
-                pt.log("    ⚠️  " + role + " (" + candidateEmail + ") thất bại: " + mr.reason, ProgressTracker.LogLevel.DETAIL);
+                pt.log("    ⚠️  " + role + " (" + candidateEmail + ") thất bại: " + mr.reason,
+                        ProgressTracker.LogLevel.DETAIL);
             } catch (Exception e) {
                 lastReason = e.getMessage();
-                pt.log("    ⚠️  " + role + " (" + candidateEmail + ") exception: " + e.getMessage(), ProgressTracker.LogLevel.DETAIL);
+                pt.log("    ⚠️  " + role + " (" + candidateEmail + ") exception: " + e.getMessage(),
+                        ProgressTracker.LogLevel.DETAIL);
             }
         }
 
         // ── Fallback cuối: grant write tạm thời cho owner/finder → họ move → revoke ──
         String grantTarget = (finderEmail != null && !finderEmail.isBlank()) ? finderEmail : ownerEmail;
         if (grantTarget != null && !grantTarget.equals(userEmail)) {
-            pt.log("    🔑 Thử grant write tạm thời cho " + grantTarget + " trên targetFolder...", ProgressTracker.LogLevel.DETAIL);
+            pt.log("    🔑 Thử grant write tạm thời cho " + grantTarget + " trên targetFolder...",
+                    ProgressTracker.LogLevel.DETAIL);
             MoveResult tempResult = tryMoveWithTemporaryShare(
                     folderId, resolvedParents, targetFolderId, grantTarget, userEmail);
             if (tempResult.success) {
                 result.success = true;
                 result.actuallyMoved = true;
                 result.reason = tempResult.reason;
-                pt.log("    ✅ Move FOLDER OK via temporary share → " + targetFolderPath, ProgressTracker.LogLevel.SUCCESS);
+                pt.log("    ✅ Move FOLDER OK via temporary share → " + targetFolderPath,
+                        ProgressTracker.LogLevel.SUCCESS);
                 return result;
             }
             lastReason = tempResult.reason;
@@ -1180,9 +1659,9 @@ public class DriveRecoveryService {
         return result;
     }
 
-
     /**
-     * ⭐ FALLBACK: Grant write permission tạm thời lên targetFolder cho grantToEmail,
+     * ⭐ FALLBACK: Grant write permission tạm thời lên targetFolder cho
+     * grantToEmail,
      * để grantToEmail (owner của source) có thể addParents vào targetFolder,
      * sau đó revoke permission.
      *
@@ -1201,18 +1680,17 @@ public class DriveRecoveryService {
         try {
             // BƯỚC 1: targetFolderOwner grant WRITER cho grantToEmail trên targetFolder
             Drive ownerDrive = createDriveServiceForUserWithRetry(targetFolderOwnerEmail);
-            com.google.api.services.drive.model.Permission perm =
-                    new com.google.api.services.drive.model.Permission();
+            com.google.api.services.drive.model.Permission perm = new com.google.api.services.drive.model.Permission();
             perm.setType("user");
             perm.setRole("writer");
             perm.setEmailAddress(grantToEmail);
 
-            com.google.api.services.drive.model.Permission created =
-                    ownerDrive.permissions().create(targetFolderId, perm)
-                            .setSendNotificationEmail(false)
-                            .setSupportsAllDrives(true)
-                            .setFields("id")
-                            .execute();
+            com.google.api.services.drive.model.Permission created = ownerDrive.permissions()
+                    .create(targetFolderId, perm)
+                    .setSendNotificationEmail(false)
+                    .setSupportsAllDrives(true)
+                    .setFields("id")
+                    .execute();
             permissionId = created.getId();
             pt.log("    🔑 Đã grant write tạm thời cho " + grantToEmail, ProgressTracker.LogLevel.DETAIL);
 
@@ -1241,7 +1719,8 @@ public class DriveRecoveryService {
                             .execute();
                     pt.log("    🔑 Đã thu hồi quyền tạm thời của " + grantToEmail, ProgressTracker.LogLevel.DETAIL);
                 } catch (Exception ex) {
-                    pt.log("    ⚠️  Không thu hồi được quyền tạm thời: " + ex.getMessage(), ProgressTracker.LogLevel.WARNING);
+                    pt.log("    ⚠️  Không thu hồi được quyền tạm thời: " + ex.getMessage(),
+                            ProgressTracker.LogLevel.WARNING);
                 }
             }
         }
@@ -1272,7 +1751,8 @@ public class DriveRecoveryService {
     }
 
     private String getParentFolderName(File file) {
-        if (file.getParents() == null || file.getParents().isEmpty()) return "My Drive";
+        if (file.getParents() == null || file.getParents().isEmpty())
+            return "My Drive";
         String parentId = file.getParents().get(0);
         try {
             File parentFile = driveService.files().get(parentId)
@@ -1313,43 +1793,65 @@ public class DriveRecoveryService {
      */
     private List<FileHistory> getDirectSubFoldersFromActivity(String folderId, String userEmail) throws IOException {
         Map<String, FileHistory> map = new HashMap<>();
+
+        // ⭐ FIX: Gom toàn bộ activities từ tất cả pages TRƯỚC, rồi mới sort và process.
+        // Lý do: Activity API trả về newest-first. Nếu process từng page riêng lẻ,
+        // event
+        // REMOVE (mới hơn, page 1) sẽ bị override bởi event ADD (cũ hơn, page 2) →
+        // folder bị đánh nhầm là currentlyInFolder=true khi thực tế đã bị remove.
+        // Giải pháp: Sort toàn bộ oldest-first (giống getFilesFromActivity) → đúng thứ
+        // tự thời gian.
+        List<com.google.api.services.driveactivity.v2.model.DriveActivity> allActivities = new ArrayList<>();
         String pageToken = null;
         do {
-            com.google.api.services.driveactivity.v2.model.QueryDriveActivityRequest req =
-                    new com.google.api.services.driveactivity.v2.model.QueryDriveActivityRequest();
+            com.google.api.services.driveactivity.v2.model.QueryDriveActivityRequest req = new com.google.api.services.driveactivity.v2.model.QueryDriveActivityRequest();
             req.setAncestorName("items/" + folderId);
             req.setPageSize(100);
-            if (pageToken != null) req.setPageToken(pageToken);
-            // ⭐ FIX: Áp dụng cùng time filter như getFilesFromActivity
+            if (pageToken != null)
+                req.setPageToken(pageToken);
             String folderFilter = buildActivityFilter();
             if (folderFilter != null && !folderFilter.isEmpty()) {
                 req.setFilter(folderFilter);
             }
 
             // ⭐ FIX 429: dùng helper có semaphore + retry
-            com.google.api.services.driveactivity.v2.model.QueryDriveActivityResponse resp =
-                    executeActivityQueryWithRetry(req);
+            com.google.api.services.driveactivity.v2.model.QueryDriveActivityResponse resp = executeActivityQueryWithRetry(
+                    req);
 
             if (resp.getActivities() != null) {
-                for (com.google.api.services.driveactivity.v2.model.DriveActivity activity : resp.getActivities()) {
-                    processActivityForFolders(activity, folderId, map);
-                }
+                allActivities.addAll(resp.getActivities());
             }
             pageToken = resp.getNextPageToken();
         } while (pageToken != null);
 
+        // Sort oldest-first → event cũ hơn (ADD) được process trước, event mới hơn
+        // (REMOVE) sau
+        // → final state phản ánh đúng sự kiện gần nhất (same logic as
+        // getFilesFromActivity)
+        allActivities.sort((a, b) -> {
+            String ta = a.getTimestamp() != null ? a.getTimestamp() : "";
+            String tb = b.getTimestamp() != null ? b.getTimestamp() : "";
+            return ta.compareTo(tb);
+        });
+
+        for (com.google.api.services.driveactivity.v2.model.DriveActivity activity : allActivities) {
+            processActivityForFolders(activity, folderId, map);
+        }
+
         return map.values().stream()
-                .filter(fh -> fh.everInFolder)
+                // Include: folder từng ở đây (everInFolder), HOẶC folder bị DELETE khỏi subtree
+                // (deletedFromSubtree=true → có thể là direct child bị xóa vào Trash)
+                .filter(fh -> fh.everInFolder || fh.deletedFromSubtree)
                 .collect(java.util.stream.Collectors.toList());
     }
 
     /**
      * ⭐ FIX 429: Gọi Activity API với:
-     *  1. Semaphore (1 permit) → chỉ 1 thread gọi tại một lúc (quota là per-user per-minute)
-     *  2. Exponential backoff retry tối đa 5 lần khi gặp RATE_LIMIT_EXCEEDED (429)
+     * 1. Semaphore (1 permit) → chỉ 1 thread gọi tại một lúc (quota là per-user
+     * per-minute)
+     * 2. Exponential backoff retry tối đa 5 lần khi gặp RATE_LIMIT_EXCEEDED (429)
      */
-    private com.google.api.services.driveactivity.v2.model.QueryDriveActivityResponse
-    executeActivityQueryWithRetry(
+    private com.google.api.services.driveactivity.v2.model.QueryDriveActivityResponse executeActivityQueryWithRetry(
             com.google.api.services.driveactivity.v2.model.QueryDriveActivityRequest req)
             throws IOException {
 
@@ -1366,10 +1868,14 @@ public class DriveRecoveryService {
             }
 
             try {
-                com.google.api.services.driveactivity.v2.model.QueryDriveActivityResponse resp =
-                        activityService.activity().query(req).execute();
+                com.google.api.services.driveactivity.v2.model.QueryDriveActivityResponse resp = activityService
+                        .activity().query(req).execute();
                 // Thêm delay nhỏ giữa các call để tránh burst (300ms)
-                try { Thread.sleep(300); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+                try {
+                    Thread.sleep(300);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                }
                 return resp;
 
             } catch (com.google.api.client.googleapis.json.GoogleJsonResponseException e) {
@@ -1377,10 +1883,14 @@ public class DriveRecoveryService {
                     long waitMs = baseDelayMs * (1L << attempt); // 2s, 4s, 8s, 16s, 32s
                     ProgressTracker.getInstance().log(
                             "  ⏳ Activity API 429 (attempt " + (attempt + 1) + "/" + maxRetries + ")" +
-                            " — chờ " + (waitMs / 1000) + "s rồi retry...",
+                                    " — chờ " + (waitMs / 1000) + "s rồi retry...",
                             ProgressTracker.LogLevel.WARNING);
                     if (attempt < maxRetries) {
-                        try { Thread.sleep(waitMs); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+                        try {
+                            Thread.sleep(waitMs);
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                        }
                     } else {
                         // 429 hết retry → không crash, bỏ qua activity cho folder này
                         ProgressTracker.getInstance().log(
@@ -1391,7 +1901,8 @@ public class DriveRecoveryService {
                 } else {
                     // 403/404/other → KHÔNG crash, bỏ qua activity cho folder này
                     String detail = (e.getDetails() != null && e.getDetails().getMessage() != null)
-                            ? e.getDetails().getMessage() : e.getMessage();
+                            ? e.getDetails().getMessage()
+                            : e.getMessage();
                     ProgressTracker.getInstance().log(
                             "  ⚠️  Activity API HTTP " + e.getStatusCode() + " (" + detail + ") — bỏ qua",
                             ProgressTracker.LogLevel.DETAIL);
@@ -1418,7 +1929,8 @@ public class DriveRecoveryService {
      *
      * Thay thế vòng loop N users cũ → chỉ cần 1 API call để biết owner là ai.
      *
-     * Reports API query: doc_id == fileId → trả về audit log events có chứa field "owner"
+     * Reports API query: doc_id == fileId → trả về audit log events có chứa field
+     * "owner"
      *
      * @return email của owner, hoặc null nếu không có log nào
      */
@@ -1447,21 +1959,19 @@ public class DriveRecoveryService {
             }
 
             // Khởi tạo Reports service
-            com.google.api.services.reports.Reports reportsService =
-                    new com.google.api.services.reports.Reports.Builder(
-                            com.google.api.client.googleapis.javanet.GoogleNetHttpTransport.newTrustedTransport(),
-                            com.google.api.client.json.gson.GsonFactory.getDefaultInstance(),
-                            new com.google.auth.http.HttpCredentialsAdapter(adminCreds))
-                            .setApplicationName("Drive Recovery Tool v2.0")
-                            .build();
+            com.google.api.services.reports.Reports reportsService = new com.google.api.services.reports.Reports.Builder(
+                    com.google.api.client.googleapis.javanet.GoogleNetHttpTransport.newTrustedTransport(),
+                    com.google.api.client.json.gson.GsonFactory.getDefaultInstance(),
+                    new com.google.auth.http.HttpCredentialsAdapter(adminCreds))
+                    .setApplicationName("Drive Recovery Tool v2.0")
+                    .build();
 
             // Query audit log: tìm tất cả events có doc_id == fileId
-            com.google.api.services.reports.model.Activities activities =
-                    reportsService.activities()
-                            .list("all", "drive")
-                            .setFilters("doc_id==" + fileId)
-                            .setMaxResults(10)
-                            .execute();
+            com.google.api.services.reports.model.Activities activities = reportsService.activities()
+                    .list("all", "drive")
+                    .setFilters("doc_id==" + fileId)
+                    .setMaxResults(10)
+                    .execute();
 
             if (activities.getItems() == null || activities.getItems().isEmpty()) {
                 return null; // Không có log nào cho file/folder này
@@ -1469,29 +1979,37 @@ public class DriveRecoveryService {
 
             // Duyệt qua events, tìm field "owner" trong parameters
             for (com.google.api.services.reports.model.Activity activity : activities.getItems()) {
-                if (activity.getEvents() == null) continue;
+                if (activity.getEvents() == null)
+                    continue;
                 for (com.google.api.services.reports.model.Activity.Events event : activity.getEvents()) {
-                    if (event.getParameters() == null) continue;
-                    for (com.google.api.services.reports.model.Activity.Events.Parameters param : event.getParameters()) {
-                        if ("owner".equals(param.getName()) && param.getValue() != null && !param.getValue().isBlank()) {
+                    if (event.getParameters() == null)
+                        continue;
+                    for (com.google.api.services.reports.model.Activity.Events.Parameters param : event
+                            .getParameters()) {
+                        if ("owner".equals(param.getName()) && param.getValue() != null
+                                && !param.getValue().isBlank()) {
                             return param.getValue(); // ← owner email tìm thấy!
                         }
                     }
                 }
             }
 
-            // Nếu không thấy field "owner" → thử lấy từ actor (người thực hiện action đầu tiên)
+            // Nếu không thấy field "owner" → thử lấy từ actor (người thực hiện action đầu
+            // tiên)
             com.google.api.services.reports.model.Activity first = activities.getItems().get(0);
             if (first.getActor() != null && first.getActor().getEmail() != null) {
-                pt.log("    ℹ️  Không có field 'owner' trong params → dùng actor: " + first.getActor().getEmail(), ProgressTracker.LogLevel.DETAIL);
+                pt.log("    ℹ️  Không có field 'owner' trong params → dùng actor: " + first.getActor().getEmail(),
+                        ProgressTracker.LogLevel.DETAIL);
                 return first.getActor().getEmail();
             }
 
         } catch (com.google.api.client.googleapis.json.GoogleJsonResponseException e) {
             if (e.getStatusCode() == 403) {
-                pt.log("    ⚠️  Reports API 403 — Service Account chưa được grant scope admin.reports.audit.readonly", ProgressTracker.LogLevel.WARNING);
+                pt.log("    ⚠️  Reports API 403 — Service Account chưa được grant scope admin.reports.audit.readonly",
+                        ProgressTracker.LogLevel.WARNING);
             } else {
-                pt.log("    ⚠️  Reports API lỗi HTTP " + e.getStatusCode() + ": " + e.getMessage(), ProgressTracker.LogLevel.WARNING);
+                pt.log("    ⚠️  Reports API lỗi HTTP " + e.getStatusCode() + ": " + e.getMessage(),
+                        ProgressTracker.LogLevel.WARNING);
             }
         } catch (Exception e) {
             pt.log("    ⚠️  Reports API exception: " + e.getMessage(), ProgressTracker.LogLevel.WARNING);
@@ -1675,7 +2193,9 @@ public class DriveRecoveryService {
         } while (pageToken != null);
 
         List<FileHistory> result = fileHistoryMap.values().stream()
-                .filter(fh -> fh.everInFolder)
+                // Include: file từng ở đây (everInFolder), HOẶC file bị DELETE khỏi subtree
+                // (deletedFromSubtree=true → có thể là direct child bị xóa vào Trash)
+                .filter(fh -> fh.everInFolder || fh.deletedFromSubtree)
                 .collect(Collectors.toList());
 
         System.out.println("  🔍 Có " + result.size() + " file từng thuộc TRỰC TIẾP folder này");
@@ -1761,13 +2281,15 @@ public class DriveRecoveryService {
 
             String earliestTime = "N/A";
             if (activities.get(0).getTimestamp() != null) {
-                earliestTime = displayFormat.format(parseIsoTimestamp(activities.get(0).getTimestamp(), isoParserMs, isoParserNoMs));
+                earliestTime = displayFormat
+                        .format(parseIsoTimestamp(activities.get(0).getTimestamp(), isoParserMs, isoParserNoMs));
             }
 
             String latestTime = "N/A";
             if (activities.get(activities.size() - 1).getTimestamp() != null) {
                 latestTime = displayFormat.format(
-                        parseIsoTimestamp(activities.get(activities.size() - 1).getTimestamp(), isoParserMs, isoParserNoMs));
+                        parseIsoTimestamp(activities.get(activities.size() - 1).getTimestamp(), isoParserMs,
+                                isoParserNoMs));
             }
 
             System.out.println("  📅 Khoảng activity đã đọc:");
@@ -1811,14 +2333,21 @@ public class DriveRecoveryService {
                 continue;
             }
 
-            // Bỏ qua nếu target là Folder (chỉ xử lý file ở đây)
-            if (target.getDriveItem().getDriveFolder() != null) {
+            // ⭐ FIX BUG: Bỏ qua nếu target là Folder (chỉ xử lý file ở đây)
+            // BUG CŨ: chỉ check getDriveFolder() != null → folder bị MOVE không có
+            // driveFolder
+            // field → bị xử lý nhầm như file
+            // FIX: check EITHER driveFolder != null OR mimeType là folder
+            boolean isFolderTarget = target.getDriveItem().getDriveFolder() != null
+                    || "application/vnd.google-apps.folder".equals(target.getDriveItem().getMimeType());
+            if (isFolderTarget) {
                 continue;
             }
 
             // ⭐ FIX: getDriveFile() == null với PDF/binary file upload — KHÔNG bỏ qua!
             // getDriveFile() chỉ non-null với Google Workspace files (Docs, Sheets...)
-            // Uploaded files (PDF, docx, image...) có getDriveFile() == null nhưng vẫn là file hợp lệ
+            // Uploaded files (PDF, docx, image...) có getDriveFile() == null nhưng vẫn là
+            // file hợp lệ
 
             String fileId = extractFileId(target.getDriveItem().getName());
             String fileName = target.getDriveItem().getTitle();
@@ -1828,6 +2357,7 @@ public class DriveRecoveryService {
 
             boolean addedToFolder = false;
             boolean removedFromFolder = false;
+            boolean deletedFlag = false; // ⭐ FIX: track DELETE event separately
 
             for (ActionDetail detail : allActions) {
                 // ⭐ CREATE — xử lý giống folder: verify parent bằng Drive API
@@ -1835,18 +2365,39 @@ public class DriveRecoveryService {
                 // Bắt: file upload trực tiếp vào folder (không qua MOVE)
                 if (detail.getCreate() != null) {
                     try {
-                        com.google.api.services.drive.model.File fileMeta =
-                                driveService.files().get(fileId)
-                                        .setFields("parents, trashed")
-                                        .setSupportsAllDrives(true)
-                                        .execute();
+                        com.google.api.services.drive.model.File fileMeta = driveService.files().get(fileId)
+                                .setFields("parents, trashed")
+                                .setSupportsAllDrives(true)
+                                .execute();
                         if (fileMeta.getParents() != null
                                 && fileMeta.getParents().contains(folderId)
                                 && (fileMeta.getTrashed() == null || !fileMeta.getTrashed())) {
                             addedToFolder = true;
                         }
+                    } catch (com.google.api.client.googleapis.json.GoogleJsonResponseException gje) {
+                        if (gje.getStatusCode() == 404) {
+                            // File bị xóa vĩnh viễn → không verify được parents.
+                            // ⚠️ QUAN TRỌNG: ancestorName query trả về TOÀN BỘ subtree.
+                            // File 404 này có thể từng tạo trong D (cháu của B), không phải
+                            // trực tiếp trong B. Không thể verify → KHÔNG set addedToFolder=true.
+                            // Chỉ mark permanentlyDeleted để báo cáo, không move.
+                            if (!fileHistoryMap.containsKey(fileId)) {
+                                FileHistory newFh = new FileHistory();
+                                newFh.id = fileId;
+                                newFh.name = fileName;
+                                newFh.everInFolder = true;
+                                newFh.currentlyInFolder = false; // 404 → không thể move
+                                newFh.permanentlyDeleted = true;
+                                newFh.lastSeenTimestamp = timestamp;
+                                fileHistoryMap.put(fileId, newFh);
+                            } else {
+                                fileHistoryMap.get(fileId).permanentlyDeleted = true;
+                                fileHistoryMap.get(fileId).currentlyInFolder = false;
+                            }
+                        }
+                        // HTTP khác (403, 500...) → bỏ qua CREATE này, không đủ info
                     } catch (Exception ignored) {
-                        // File đã bị xóa → không verify được parents → bỏ qua CREATE này
+                        // Network/IO lỗi → bỏ qua, không crash
                     }
                 }
 
@@ -1872,10 +2423,37 @@ public class DriveRecoveryService {
                         }
                     }
                 }
+                // ⭐ FIX: Detect DELETE event cho file
+                // Khi file bị xóa (DELETE): không có addedParents/removedParents
+                // → addedToFolder và removedFromFolder đều false → bị skip ở line bên dưới
+                // Fix: detect DELETE và mark deletedFromSubtree=true để checkFolder biết
+                if (detail.getDelete() != null) {
+                    deletedFlag = true; // ⭐ FIX: chỉ set flag, xử lý SAU guard
+                }
             }
 
-            if (!addedToFolder && !removedFromFolder) {
+            // ⭐ FIX: Include deletedFlag trong guard — DELETE-only items vẫn được xử lý.
+            // Deepest folder (D) xử lý trước nhờ Collections.reverse() → kéo C về D đúng.
+            // Shallower folder (B) chạy sau: C.parents=[D], D∈subtree(B) → grandchild → skip.
+            if (!addedToFolder && !removedFromFolder && !deletedFlag) {
                 continue;
+            }
+
+            // ⭐ FIX: Handle DELETE SAU guard — deepest folder thắng, shallower bị block
+            if (deletedFlag) {
+                if (!fileHistoryMap.containsKey(fileId)) {
+                    FileHistory newFh = new FileHistory();
+                    newFh.id = fileId;
+                    newFh.name = fileName;
+                    newFh.everInFolder = false;
+                    newFh.currentlyInFolder = false;
+                    newFh.deletedFromSubtree = true;
+                    newFh.lastSeenTimestamp = timestamp;
+                    fileHistoryMap.put(fileId, newFh);
+                } else {
+                    fileHistoryMap.get(fileId).currentlyInFolder = false;
+                    fileHistoryMap.get(fileId).deletedFromSubtree = true;
+                }
             }
 
             if (!fileHistoryMap.containsKey(fileId)) {
@@ -1898,7 +2476,8 @@ public class DriveRecoveryService {
             }
 
             if (removedFromFolder) {
-                // KEY FIX: nếu file bị REMOVE khỏi folder này → nó chắc chắn đã TỮNG ở trong folder
+                // KEY FIX: nếu file bị REMOVE khỏi folder này → nó chắc chắn đã TỮNG ở trong
+                // folder
                 // (cả trường hợp: auto-removed, bị admin xóa, folder bị un-share)
                 fh.everInFolder = true;
                 fh.name = fileName;
@@ -1924,7 +2503,8 @@ public class DriveRecoveryService {
             String folderId,
             Map<String, FileHistory> map) {
 
-        if (activity.getTargets() == null) return;
+        if (activity.getTargets() == null)
+            return;
 
         String timestamp = activity.getTimestamp();
 
@@ -1942,27 +2522,39 @@ public class DriveRecoveryService {
         }
 
         for (Target target : activity.getTargets()) {
-            if (target.getDriveItem() == null) continue;
+            if (target.getDriveItem() == null)
+                continue;
 
-            // Chỉ xử lý FOLDER target
-            if (target.getDriveItem().getDriveFolder() == null) continue;
+            // ⭐ FIX BUG: Chỉ xử lý FOLDER target
+            // BUG CŨ: chỉ check getDriveFolder() != null → bỏ sót folder bị MOVE
+            // vì khi MOVE, Activity API KHÔNG set driveFolder field trong target,
+            // chỉ set mimeType = "application/vnd.google-apps.folder"
+            // FIX: check EITHER driveFolder != null OR mimeType là folder
+            boolean isFolderTarget = target.getDriveItem().getDriveFolder() != null
+                    || "application/vnd.google-apps.folder".equals(target.getDriveItem().getMimeType());
+            if (!isFolderTarget)
+                continue;
 
             String foldItemId = extractFileId(target.getDriveItem().getName());
             String foldItemName = target.getDriveItem().getTitle();
-            if (foldItemId == null) continue;
+            if (foldItemId == null)
+                continue;
 
             // ⭐ FIX: Bỏ qua Shared Drive root — 2 cách detect:
             // 1. ID bắt đầu bằng "0A" (Shared Drive root format)
             // 2. DriveFolder.type = "SHARED_DRIVE_ROOT" (từ Activity API)
-            if (foldItemId.startsWith("0A")) continue;
+            if (foldItemId.startsWith("0A"))
+                continue;
             if (target.getDriveItem().getDriveFolder() != null) {
                 String folderType = target.getDriveItem().getDriveFolder().getType();
-                if ("SHARED_DRIVE_ROOT".equals(folderType)) continue;
+                if ("SHARED_DRIVE_ROOT".equals(folderType))
+                    continue;
             }
 
             boolean addedToFolder = false;
             boolean removedFromFolder = false;
             boolean createdInFolder = false;
+            boolean deletedFlag = false; // ⭐ FIX: track DELETE event separately
 
             for (ActionDetail detail : allActions) {
                 // ⭐ FIX: Detect CREATE event cho folder trực tiếp trong folderId
@@ -1970,18 +2562,40 @@ public class DriveRecoveryService {
                 // Dùng Drive API để check parents (chấp nhận 1 API call cho CREATE event)
                 if (detail.getCreate() != null) {
                     try {
-                        com.google.api.services.drive.model.File folderMeta =
-                                driveService.files().get(foldItemId)
-                                        .setFields("parents, trashed")
-                                        .setSupportsAllDrives(true)
-                                        .execute();
+                        com.google.api.services.drive.model.File folderMeta = driveService.files().get(foldItemId)
+                                .setFields("parents, trashed")
+                                .setSupportsAllDrives(true)
+                                .execute();
                         if (folderMeta.getParents() != null
                                 && folderMeta.getParents().contains(folderId)
                                 && (folderMeta.getTrashed() == null || !folderMeta.getTrashed())) {
                             createdInFolder = true;
                         }
+                    } catch (com.google.api.client.googleapis.json.GoogleJsonResponseException gje) {
+                        if (gje.getStatusCode() == 404) {
+                            // Folder bị xóa vĩnh viễn → không verify được parents.
+                            // ⚠️ QUAN TRỌNG: ancestorName query trả về TOÀN BỘ subtree.
+                            // Folder 404 này có thể từng là direct child CỦA BẤT KỲ FOLDER NÀO
+                            // trong subtree — KHÔNG CHỈ folderId. Đánh dấu everInFolder=true
+                            // nhưng currentlyInFolder=false để báo cáo (không move) vì
+                            // không thể xác nhận nó thực sự là direct child của folderId.
+                            if (!map.containsKey(foldItemId)) {
+                                FileHistory newFh = new FileHistory();
+                                newFh.id = foldItemId;
+                                newFh.name = foldItemName;
+                                newFh.everInFolder = true;
+                                newFh.currentlyInFolder = false; // 404 → không thể move
+                                newFh.permanentlyDeleted = true;
+                                newFh.lastSeenTimestamp = timestamp;
+                                map.put(foldItemId, newFh);
+                            } else {
+                                map.get(foldItemId).permanentlyDeleted = true;
+                                map.get(foldItemId).currentlyInFolder = false;
+                            }
+                        }
+                        // HTTP khác (403, 500...) → bỏ qua CREATE này, không đủ info
                     } catch (Exception ignored) {
-                        // Folder có thể đã bị xóa → không check được parents → bỏ qua
+                        // Network/IO lỗi → bỏ qua, không crash
                     }
                 }
 
@@ -2004,10 +2618,41 @@ public class DriveRecoveryService {
                         }
                     }
                 }
+                // ⭐ FIX: Detect DELETE event
+                // Khi folder B bị xóa khỏi folder A (owner là user khác delete):
+                // - Activity API trả về event DELETE cho folder B
+                // - KHÔNG có addedParents/removedParents (vì không phải MOVE)
+                // - Sau khi xóa, không thể gọi Drive API verify parents nữa
+                // → dùng dấu hiệu: query là ancestorName=folderId, nếu có DELETE
+                // thì folder này từng nằm trong subtree của folderId
+                // → cần mark để báo cáo (permanentlyDeleted hoặc in trash)
+                if (detail.getDelete() != null) {
+                    deletedFlag = true; // ⭐ FIX: chỉ set flag, xử lý SAU guard
+                }
             }
 
-            // Skip nếu không có sự kiện liên quan đến folderId
-            if (!addedToFolder && !removedFromFolder && !createdInFolder) continue;
+            // ⭐ FIX: Include deletedFlag trong guard — DELETE-only items vẫn được xử lý.
+            // Deepest folder (D) xử lý trước nhờ Collections.reverse() → kéo C về D đúng.
+            // Shallower folder (B) chạy sau: C.parents=[D], D∈allDescendantIds(B) → skip.
+            if (!addedToFolder && !removedFromFolder && !createdInFolder && !deletedFlag)
+                continue;
+
+            // ⭐ FIX: Handle DELETE SAU guard — deepest folder thắng, shallower bị block
+            if (deletedFlag) {
+                if (!map.containsKey(foldItemId)) {
+                    FileHistory newFh = new FileHistory();
+                    newFh.id = foldItemId;
+                    newFh.name = foldItemName;
+                    newFh.everInFolder = false;
+                    newFh.currentlyInFolder = false;
+                    newFh.deletedFromSubtree = true;
+                    newFh.lastSeenTimestamp = timestamp;
+                    map.put(foldItemId, newFh);
+                } else {
+                    map.get(foldItemId).currentlyInFolder = false;
+                    map.get(foldItemId).deletedFromSubtree = true;
+                }
+            }
 
             if (!map.containsKey(foldItemId)) {
                 FileHistory newFh = new FileHistory();
@@ -2069,11 +2714,13 @@ public class DriveRecoveryService {
         result.success = false;
         ProgressTracker pt = ProgressTracker.getInstance();
 
-        // ⭐ FIX: Nếu parents null (folder/file đang ở root My Drive — impersonation không thấy được)
+        // ⭐ FIX: Nếu parents null (folder/file đang ở root My Drive — impersonation
+        // không thấy được)
         // → dùng "root" làm removeParents (keyword của Drive API = My Drive root)
         List<String> effectiveParents = currentParents;
         if (effectiveParents == null || effectiveParents.isEmpty()) {
-            pt.log("    ⚠️  Parents null → thử dùng 'root' làm removeParents (item ở My Drive root)", ProgressTracker.LogLevel.DETAIL);
+            pt.log("    ⚠️  Parents null → thử dùng 'root' làm removeParents (item ở My Drive root)",
+                    ProgressTracker.LogLevel.DETAIL);
             effectiveParents = java.util.Collections.singletonList("root");
         }
 
@@ -2101,7 +2748,11 @@ public class DriveRecoveryService {
                     .execute();
 
             // ⭐ Verify: list file trong target folder
-            try { Thread.sleep(500); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            try {
+                Thread.sleep(500);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
             boolean verified = verifyInTargetFolder(fileId, targetFolderId, driveService);
             if (verified) {
                 result.success = true;
@@ -2110,7 +2761,8 @@ public class DriveRecoveryService {
             } else {
                 result.success = true;
                 result.reason = "Success (update API OK — verify skipped do impersonation limit)";
-                pt.log("    ⚠️  Verify không confirm được nhưng update API OK → coi là thành công", ProgressTracker.LogLevel.DETAIL);
+                pt.log("    ⚠️  Verify không confirm được nhưng update API OK → coi là thành công",
+                        ProgressTracker.LogLevel.DETAIL);
                 return result;
             }
 
@@ -2120,11 +2772,14 @@ public class DriveRecoveryService {
             // xóa parent cũ (vd: My Drive root của user khác → 404 trên removeParents).
             // File sẽ xuất hiện ở cả 2 nơi nhưng ít nhất về được target folder.
             String errorMsg = fullMoveEx.getDetails() != null
-                    ? fullMoveEx.getDetails().getMessage() : fullMoveEx.getMessage();
-            pt.log("    ❌ Move FAILED (" + fullMoveEx.getStatusCode() + "): " + errorMsg, ProgressTracker.LogLevel.ERROR);
+                    ? fullMoveEx.getDetails().getMessage()
+                    : fullMoveEx.getMessage();
+            pt.log("    ❌ Move FAILED (" + fullMoveEx.getStatusCode() + "): " + errorMsg,
+                    ProgressTracker.LogLevel.ERROR);
 
             if (fullMoveEx.getStatusCode() == 404 || fullMoveEx.getStatusCode() == 403) {
-                pt.log("    🔄 Thử fallback: addParents-only (không removeParents)...", ProgressTracker.LogLevel.DETAIL);
+                pt.log("    🔄 Thử fallback: addParents-only (không removeParents)...",
+                        ProgressTracker.LogLevel.DETAIL);
                 try {
                     driveService.files().update(fileId, null)
                             .setAddParents(targetFolderId)
@@ -2133,12 +2788,17 @@ public class DriveRecoveryService {
                             .setFields("id, parents")
                             .execute();
 
-                    try { Thread.sleep(500); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+                    try {
+                        Thread.sleep(500);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                    }
                     boolean verified = verifyInTargetFolder(fileId, targetFolderId, driveService);
                     if (verified) {
                         result.success = true;
                         result.reason = "Success (addParents-only — file pinned to target, still in source)";
-                        pt.log("    ✅ Fallback OK: file đã xuất hiện ở target folder (vẫn còn ở nguồn)", ProgressTracker.LogLevel.SUCCESS);
+                        pt.log("    ✅ Fallback OK: file đã xuất hiện ở target folder (vẫn còn ở nguồn)",
+                                ProgressTracker.LogLevel.SUCCESS);
                         return result;
                     } else {
                         result.success = true;
@@ -2148,8 +2808,10 @@ public class DriveRecoveryService {
                     }
                 } catch (com.google.api.client.googleapis.json.GoogleJsonResponseException fallbackEx) {
                     String fbMsg = fallbackEx.getDetails() != null
-                            ? fallbackEx.getDetails().getMessage() : fallbackEx.getMessage();
-                    pt.log("    ❌ Fallback cũng FAILED (" + fallbackEx.getStatusCode() + "): " + fbMsg, ProgressTracker.LogLevel.ERROR);
+                            ? fallbackEx.getDetails().getMessage()
+                            : fallbackEx.getMessage();
+                    pt.log("    ❌ Fallback cũng FAILED (" + fallbackEx.getStatusCode() + "): " + fbMsg,
+                            ProgressTracker.LogLevel.ERROR);
                     result.reason = "HTTP " + fullMoveEx.getStatusCode() + ": " + errorMsg
                             + " | Fallback: HTTP " + fallbackEx.getStatusCode() + ": " + fbMsg;
                     return result;
@@ -2183,7 +2845,8 @@ public class DriveRecoveryService {
             if (verifyFile.getParents() != null && verifyFile.getParents().contains(targetFolderId)) {
                 return true;
             }
-        } catch (Exception ignored) {}
+        } catch (Exception ignored) {
+        }
 
         // Fallback: list file trong target folder bằng main driveService
         try {
@@ -2196,10 +2859,10 @@ public class DriveRecoveryService {
                     .setIncludeItemsFromAllDrives(true)
                     .execute();
             return fl.getFiles() != null && fl.getFiles().stream().anyMatch(f -> fileId.equals(f.getId()));
-        } catch (Exception ignored) {}
+        } catch (Exception ignored) {
+        }
         return false;
     }
-
 
     private List<File> getCurrentFilesInFolder(String folderId, String userEmail) throws IOException {
         List<File> files = new ArrayList<>();
@@ -2323,7 +2986,8 @@ public class DriveRecoveryService {
      * Invalid chars: [ ] \ / * ? :
      */
     private String sanitizeSheetName(String name) {
-        if (name == null || name.isEmpty()) return "Sheet";
+        if (name == null || name.isEmpty())
+            return "Sheet";
         return name.replaceAll("[\\[\\]\\\\/\\*\\?:]", "").trim();
     }
 
@@ -2510,22 +3174,27 @@ public class DriveRecoveryService {
         redStyle.setFillForegroundColor(IndexedColors.ROSE.getIndex());
         redStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
 
-        // Real statistics (currentStatus bị skip để tiết kiệm API — dùng action/status thay thế)
+        // Real statistics (currentStatus bị skip để tiết kiệm API — dùng action/status
+        // thay thế)
         long totalFilesAll = 0, filesOKAll = 0, filesMissingAll = 0, filesMovedAll = 0, filesNotFoundAll = 0;
         long totalFoldersAll = 0, foldersOKAll = 0, foldersMissingAll = 0, foldersMovedAll = 0;
         for (FolderReport report : reports) {
             if (report.files != null) {
                 totalFilesAll += report.files.size();
-                filesOKAll += report.files.stream().filter(f -> "Có".equals(f.status) || "Trong subfolder".equals(f.status)).count();
+                filesOKAll += report.files.stream()
+                        .filter(f -> "Có".equals(f.status) || "Trong subfolder".equals(f.status)).count();
                 filesMissingAll += report.files.stream().filter(f -> "Thiếu".equals(f.status)).count();
-                filesMovedAll += report.files.stream().filter(f -> f.action != null && f.action.startsWith("Đã move")).count();
-                filesNotFoundAll += report.files.stream().filter(f -> f.action != null && f.action.startsWith("Lỗi: Không tìm thấy")).count();
+                filesMovedAll += report.files.stream().filter(f -> f.action != null && f.action.startsWith("Đã move"))
+                        .count();
+                filesNotFoundAll += report.files.stream()
+                        .filter(f -> f.action != null && f.action.startsWith("Lỗi: Không tìm thấy")).count();
             }
             if (report.subFolders != null) {
                 totalFoldersAll += report.subFolders.size();
                 foldersOKAll += report.subFolders.stream().filter(sf -> "Có".equals(sf.status)).count();
                 foldersMissingAll += report.subFolders.stream().filter(sf -> "Thiếu".equals(sf.status)).count();
-                foldersMovedAll += report.subFolders.stream().filter(sf -> sf.action != null && sf.action.startsWith("Đã move")).count();
+                foldersMovedAll += report.subFolders.stream()
+                        .filter(sf -> sf.action != null && sf.action.startsWith("Đã move")).count();
             }
         }
 
@@ -2533,18 +3202,43 @@ public class DriveRecoveryService {
 
         int row = 3;
         // FILE stats
-        Row r1 = sheet.createRow(row++); r1.createCell(0).setCellValue("📄 Tổng số file trong activity:"); r1.createCell(1).setCellValue(totalFilesAll);
-        Row r2 = sheet.createRow(row++); r2.createCell(0).setCellValue("✅ File đang có (OK):"); r2.createCell(1).setCellValue(filesOKAll); r2.getCell(0).setCellStyle(greenStyle);
-        Row r3 = sheet.createRow(row++); r3.createCell(0).setCellValue("❌ File bị thiếu:"); r3.createCell(1).setCellValue(filesMissingAll); r3.getCell(0).setCellStyle(filesMissingAll > 0 ? redStyle : greenStyle);
-        Row r4 = sheet.createRow(row++); r4.createCell(0).setCellValue("🔄 File đã move về thành công:"); r4.createCell(1).setCellValue(filesMovedAll); r4.getCell(0).setCellStyle(greenStyle);
-        Row r5 = sheet.createRow(row++); r5.createCell(0).setCellValue("🔍 File không tìm thấy:"); r5.createCell(1).setCellValue(filesNotFoundAll); r5.getCell(0).setCellStyle(filesNotFoundAll > 0 ? redStyle : greenStyle);
+        Row r1 = sheet.createRow(row++);
+        r1.createCell(0).setCellValue("📄 Tổng số file trong activity:");
+        r1.createCell(1).setCellValue(totalFilesAll);
+        Row r2 = sheet.createRow(row++);
+        r2.createCell(0).setCellValue("✅ File đang có (OK):");
+        r2.createCell(1).setCellValue(filesOKAll);
+        r2.getCell(0).setCellStyle(greenStyle);
+        Row r3 = sheet.createRow(row++);
+        r3.createCell(0).setCellValue("❌ File bị thiếu:");
+        r3.createCell(1).setCellValue(filesMissingAll);
+        r3.getCell(0).setCellStyle(filesMissingAll > 0 ? redStyle : greenStyle);
+        Row r4 = sheet.createRow(row++);
+        r4.createCell(0).setCellValue("🔄 File đã move về thành công:");
+        r4.createCell(1).setCellValue(filesMovedAll);
+        r4.getCell(0).setCellStyle(greenStyle);
+        Row r5 = sheet.createRow(row++);
+        r5.createCell(0).setCellValue("🔍 File không tìm thấy:");
+        r5.createCell(1).setCellValue(filesNotFoundAll);
+        r5.getCell(0).setCellStyle(filesNotFoundAll > 0 ? redStyle : greenStyle);
         row++;
         // FOLDER stats
         if (Config.getSearchFolders()) {
-            Row rf1 = sheet.createRow(row++); rf1.createCell(0).setCellValue("📁 Tổng số subfolder trong activity:"); rf1.createCell(1).setCellValue(totalFoldersAll);
-            Row rf2 = sheet.createRow(row++); rf2.createCell(0).setCellValue("✅ Folder đang có (OK):"); rf2.createCell(1).setCellValue(foldersOKAll); rf2.getCell(0).setCellStyle(greenStyle);
-            Row rf3 = sheet.createRow(row++); rf3.createCell(0).setCellValue("❌ Folder bị thiếu:"); rf3.createCell(1).setCellValue(foldersMissingAll); rf3.getCell(0).setCellStyle(foldersMissingAll > 0 ? redStyle : greenStyle);
-            Row rf4 = sheet.createRow(row++); rf4.createCell(0).setCellValue("🔄 Folder đã move về thành công:"); rf4.createCell(1).setCellValue(foldersMovedAll); rf4.getCell(0).setCellStyle(greenStyle);
+            Row rf1 = sheet.createRow(row++);
+            rf1.createCell(0).setCellValue("📁 Tổng số subfolder trong activity:");
+            rf1.createCell(1).setCellValue(totalFoldersAll);
+            Row rf2 = sheet.createRow(row++);
+            rf2.createCell(0).setCellValue("✅ Folder đang có (OK):");
+            rf2.createCell(1).setCellValue(foldersOKAll);
+            rf2.getCell(0).setCellStyle(greenStyle);
+            Row rf3 = sheet.createRow(row++);
+            rf3.createCell(0).setCellValue("❌ Folder bị thiếu:");
+            rf3.createCell(1).setCellValue(foldersMissingAll);
+            rf3.getCell(0).setCellStyle(foldersMissingAll > 0 ? redStyle : greenStyle);
+            Row rf4 = sheet.createRow(row++);
+            rf4.createCell(0).setCellValue("🔄 Folder đã move về thành công:");
+            rf4.createCell(1).setCellValue(foldersMovedAll);
+            rf4.getCell(0).setCellStyle(greenStyle);
             row++;
         }
 
@@ -2716,7 +3410,8 @@ public class DriveRecoveryService {
                             && (file.action.contains("Không tìm thấy") || file.action.startsWith("Lỗi:"));
                     boolean isInTrash = file.action != null && file.action.contains("TRASH");
 
-                    if (!isNotFound && !isInTrash) continue;
+                    if (!isNotFound && !isInTrash)
+                        continue;
 
                     hasDeletedFiles = true;
                     Row row = sheet.createRow(rowNum++);
@@ -2914,12 +3609,14 @@ public class DriveRecoveryService {
     static class MoveResult {
         boolean success; // true = operation ok (move success hoặc đã đúng chỗ)
         boolean actuallyMoved; // true = folder/file đã được di chuyển thật sự (dùng để quyết định đệ quy)
+        boolean inTrash; // true = item đang trong Thùng rác → KHÔNG move, chỉ báo cáo
         String reason;
         String movedFrom;
 
         MoveResult() {
             this.success = false;
             this.actuallyMoved = false;
+            this.inTrash = false;
             this.reason = "";
             this.movedFrom = "";
         }
@@ -2937,6 +3634,18 @@ public class DriveRecoveryService {
         boolean everInFolder;
         boolean currentlyInFolder;
         String lastSeenTimestamp;
+        /**
+         * true = file/folder đã bị xóa vĩnh viễn (404 khi verify CREATE event).
+         * Dùng để bỏ qua vòng tìm kiếm và ghi thẳng vào báo cáo là "Đã xóa vĩnh viễn".
+         */
+        boolean permanentlyDeleted;
+        /**
+         * true = folder bị DELETE (xóa vào Trash hoặc xóa vĩnh viễn) bởi event DELETE.
+         * Không biết chắc là direct child hay grandchild của parent folder.
+         * Cần verify qua Drive API: nếu đang trong Trash → restore được, không tìm thấy
+         * → xóa vĩnh viễn.
+         */
+        boolean deletedFromSubtree;
     }
 
     static class FolderReport {
@@ -2984,7 +3693,8 @@ public class DriveRecoveryService {
     }
 
     /**
-     * Parse ISO timestamp với fallback: thử có milliseconds trước, rồi không có milliseconds.
+     * Parse ISO timestamp với fallback: thử có milliseconds trước, rồi không có
+     * milliseconds.
      * Activity API đôi khi trả về "2026-05-02T23:59:19Z" (không có .SSS).
      */
     private java.util.Date parseIsoTimestamp(String ts,

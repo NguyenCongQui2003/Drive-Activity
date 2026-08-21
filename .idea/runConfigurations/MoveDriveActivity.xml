@@ -1,7 +1,7 @@
 <component name="ProjectRunConfigurationManager">
   <configuration default="false" name="MoveDriveActivity" type="Application" factoryName="Application" singleton="false">
     <option name="MAIN_CLASS_NAME" value="driverecovery.Main" />
-    <module name="MoveDriveActivity" />
+    <module name="drive-recovery" />
     <method v="2">
       <option name="Make" enabled="true" />
     </method>

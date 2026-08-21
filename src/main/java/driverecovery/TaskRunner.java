@@ -361,46 +361,129 @@ public class TaskRunner extends SwingWorker<Void, String> {
             }
         }
 
-        // ⭐ FIX: Nếu chưa detect được owner (ownerEmail vẫn là adminEmail) → thử từng selectedUser
-        // Admin impersonate chính mình KHÔNG có quyền xem My Drive của user khác
-        // → phải tìm user thực sự có quyền đọc folderId này
+        // ⭐ FIX: Nếu chưa detect được owner → dùng Reports API thay vì thử từng user
+        // Vòng 2:  Reports API → tìm ownerEmail của folderId → impersonate owner
+        // Vòng 2b: Nếu owner email invalid_grant → tìm username@* trong allUsersForSearch
+        // Nếu không tìm được → tiếp tục với adminEmail (kết quả có thể thiếu)
         if (!ownerDetected || ownerEmail.equals(adminEmail)) {
-            pt.log("🔍 Đang thử từng user trong selectedUsers để tìm owner thực sự của folder...", ProgressTracker.LogLevel.INFO);
-            List<String> candidates = new ArrayList<>();
-            if (appConfig.selectedUsers != null) candidates.addAll(appConfig.selectedUsers);
-            // Thêm một số user từ Config nếu có
-            candidates.addAll(Config.getAllUsersForSearch().stream()
-                    .filter(u -> !candidates.contains(u))
-                    .limit(10)  // Thử tối đa 10 user đầu để không mất quá nhiều thời gian
-                    .collect(java.util.stream.Collectors.toList()));
+            pt.log("🔍 Vòng 2: Dùng Reports API để tìm owner của folder ID: " + folderId + "...", ProgressTracker.LogLevel.INFO);
 
-            for (String candidate : candidates) {
-                if (candidate.equals(adminEmail)) continue; // admin đã thử rồi
+            // ── Vòng 2: Reports API ──────────────────────────────────────────────
+            String reportOwner = null;
+            try {
+                com.google.auth.oauth2.GoogleCredentials adminCreds =
+                        com.google.auth.oauth2.ServiceAccountCredentials
+                                .fromStream(new FileInputStream(Config.getServiceAccountFile()))
+                                .createScoped(List.of("https://www.googleapis.com/auth/admin.reports.audit.readonly"))
+                                .createDelegated(adminEmail);
+                com.google.api.services.reports.Reports reportsService =
+                        new com.google.api.services.reports.Reports.Builder(
+                                GoogleNetHttpTransport.newTrustedTransport(),
+                                GsonFactory.getDefaultInstance(),
+                                new com.google.auth.http.HttpCredentialsAdapter(adminCreds))
+                                .setApplicationName("Drive Recovery Tool v2.0")
+                                .build();
+
+                com.google.api.services.reports.model.Activities activities =
+                        reportsService.activities()
+                                .list("all", "drive")
+                                .setFilters("doc_id==" + folderId)
+                                .setMaxResults(10)
+                                .execute();
+
+                if (activities.getItems() != null) {
+                    outer:
+                    for (com.google.api.services.reports.model.Activity act : activities.getItems()) {
+                        if (act.getEvents() == null) continue;
+                        for (com.google.api.services.reports.model.Activity.Events event : act.getEvents()) {
+                            if (event.getParameters() == null) continue;
+                            for (com.google.api.services.reports.model.Activity.Events.Parameters param : event.getParameters()) {
+                                if ("owner".equals(param.getName()) && param.getValue() != null && !param.getValue().isBlank()) {
+                                    reportOwner = param.getValue();
+                                    break outer;
+                                }
+                            }
+                        }
+                    }
+                    // Fallback: lấy actor của event đầu tiên nếu không thấy field "owner"
+                    if (reportOwner == null && !activities.getItems().isEmpty()) {
+                        com.google.api.services.reports.model.Activity firstAct = activities.getItems().get(0);
+                        if (firstAct.getActor() != null && firstAct.getActor().getEmail() != null) {
+                            reportOwner = firstAct.getActor().getEmail();
+                        }
+                    }
+                }
+            } catch (Exception eReports) {
+                pt.log("⚠️ Reports API lỗi: " + eReports.getMessage(), ProgressTracker.LogLevel.WARNING);
+            }
+
+            if (reportOwner != null && !reportOwner.isBlank()) {
+                pt.log("📋 Reports API → owner: " + reportOwner, ProgressTracker.LogLevel.INFO);
+                // Thử impersonate owner từ Reports API
                 try {
-                    Drive candidateDrive = createDriveServiceForUser(candidate);
-                    com.google.api.services.drive.model.File meta = candidateDrive.files().get(folderId)
+                    Drive ownerDrive = createDriveServiceForUser(reportOwner);
+                    com.google.api.services.drive.model.File meta = ownerDrive.files().get(folderId)
                             .setFields("id, name, owners")
                             .setSupportsAllDrives(true)
                             .execute();
                     if (meta != null) {
-                        ownerEmail = candidate;
+                        ownerEmail = reportOwner;
                         ownerDetected = true;
                         if (meta.getName() != null && !meta.getName().isBlank() && folderName.equals(folderId)) {
                             folderName = meta.getName();
-                            pt.log("📁 Tên folder (qua candidate): " + folderName, ProgressTracker.LogLevel.INFO);
                         }
-                        pt.log("✅ Tìm thấy: user [" + candidate + "] có quyền đọc folder → dùng làm owner", ProgressTracker.LogLevel.SUCCESS);
-                        break;
+                        pt.log("✅ Vòng 2: Xác nhận owner qua Reports API → " + ownerEmail, ProgressTracker.LogLevel.SUCCESS);
                     }
-                } catch (Exception ignored) {
-                    pt.log("  ⬝ [" + candidate + "] không có quyền", ProgressTracker.LogLevel.DETAIL);
+                } catch (Exception eOwner) {
+                    String msg = eOwner.getMessage() != null ? eOwner.getMessage() : "";
+                    pt.log("⚠️ Vòng 2: Không impersonate được " + reportOwner + ": " + msg, ProgressTracker.LogLevel.WARNING);
+
+                    // ── Vòng 2b: invalid_grant → tìm username@* trong allUsersForSearch ──
+                    boolean isInvalidUser = msg.contains("invalid_grant") || msg.contains("Invalid email")
+                            || msg.contains("User ID") || msg.contains("400");
+                    if (isInvalidUser && reportOwner.contains("@")) {
+                        final String finalReportOwner = reportOwner; // effectively final for lambda
+                        String username = reportOwner.substring(0, reportOwner.indexOf('@'));
+                        final String finalUsername = username; // effectively final for lambda
+                        pt.log("🔄 Vòng 2b: tìm user có username '" + username + "' trong tổ chức...", ProgressTracker.LogLevel.INFO);
+                        List<String> sameUsernameList = Config.getAllUsersForSearch().stream()
+                                .filter(u -> u != null && u.startsWith(finalUsername + "@") && !u.equalsIgnoreCase(finalReportOwner))
+                                .collect(java.util.stream.Collectors.toList());
+                        for (String altEmail : sameUsernameList) {
+                            pt.log("  🔄 Vòng 2b thử: " + altEmail, ProgressTracker.LogLevel.DETAIL);
+                            try {
+                                Drive altDrive = createDriveServiceForUser(altEmail);
+                                com.google.api.services.drive.model.File meta = altDrive.files().get(folderId)
+                                        .setFields("id, name, owners")
+                                        .setSupportsAllDrives(true)
+                                        .execute();
+                                if (meta != null) {
+                                    ownerEmail = altEmail;
+                                    ownerDetected = true;
+                                    if (meta.getName() != null && !meta.getName().isBlank() && folderName.equals(folderId)) {
+                                        folderName = meta.getName();
+                                    }
+                                    pt.log("✅ Vòng 2b: Tìm thấy qua " + altEmail, ProgressTracker.LogLevel.SUCCESS);
+                                    break;
+                                }
+                            } catch (Exception altEx) {
+                                pt.log("  ⬝ " + altEmail + " không có folder này", ProgressTracker.LogLevel.DETAIL);
+                            }
+                        }
+                        if (!ownerDetected || ownerEmail.equals(adminEmail)) {
+                            pt.log("❌ Vòng 2b: Không tìm thấy user nào có username '" + username + "' có quyền → không tìm thấy folder", ProgressTracker.LogLevel.WARNING);
+                        }
+                    }
                 }
+            } else {
+                pt.log("⚠️ Reports API không có log cho folder ID này → không tìm được owner", ProgressTracker.LogLevel.WARNING);
             }
 
             if (!ownerDetected || ownerEmail.equals(adminEmail)) {
-                pt.log("⚠️ Không tìm được user nào có quyền đọc folder → tiếp tục với adminEmail (kết quả có thể thiếu)", ProgressTracker.LogLevel.WARNING);
+                pt.log("⚠️ Không tìm được owner → tiếp tục với adminEmail (kết quả có thể thiếu)", ProgressTracker.LogLevel.WARNING);
             }
         }
+
 
         // ⭐ BƯỚC 2: Xây dựng search list để tìm file/folder thất lạc
         java.util.List<String> searchList = new java.util.ArrayList<>(Config.getAllUsersForSearch());
