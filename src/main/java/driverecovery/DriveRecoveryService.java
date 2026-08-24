@@ -480,6 +480,36 @@ public class DriveRecoveryService {
                                 sfInfo.movedFrom = "-";
                                 pt.log("  │           │    ↳ ℹ️  Nested — bỏ qua, không flatten",
                                         ProgressTracker.LogLevel.INFO);
+                                // ⭐ FIX: Nếu parent thật là folder ALIVE (không trong batch)
+                                // -> cần gọi checkFolder(parent) đệ quy để xử lý item bị xóa trong đó
+                                String actualParent = queryLastKnownParent_Layer1(fh.id);
+                                if (actualParent != null
+                                        && !batchDeletedFolderIds.contains(actualParent)
+                                        && processedFolderIds.add(actualParent)) {
+                                    try {
+                                        com.google.api.services.drive.model.File pMeta = driveService.files()
+                                                .get(actualParent).setFields("id, name, trashed")
+                                                .setSupportsAllDrives(true).execute();
+                                        if (pMeta != null && !Boolean.TRUE.equals(pMeta.getTrashed())) {
+                                            pt.log("  │  [LIVE-PARENT] " + pMeta.getName()
+                                                    + " -> checkFolder đệ quy", ProgressTracker.LogLevel.INFO);
+                                            FolderInfo liveParent = new FolderInfo();
+                                            liveParent.id = actualParent;
+                                            liveParent.name = pMeta.getName();
+                                            liveParent.path = folder.path + "/" + pMeta.getName();
+                                            try {
+                                                FolderReport sr = checkFolder(liveParent, userEmail);
+                                                allReports.add(sr);
+                                            } catch (Exception exLP) {
+                                                pt.log("  ⚠️ checkFolder live-parent lỗi: " + exLP.getMessage(),
+                                                        ProgressTracker.LogLevel.WARNING);
+                                            }
+                                        }
+                                    } catch (Exception exLP) {
+                                        pt.log("  ⚠️ Verify parent " + actualParent + " lỗi: " + exLP.getMessage(),
+                                                ProgressTracker.LogLevel.WARNING);
+                                    }
+                                }
                             } else if (resolution == ParentResolution.CONFIRMED_DIRECT) {
                                 pt.log("  │           │    ↳ ✅ Direct child → verify Drive API",
                                         ProgressTracker.LogLevel.INFO);
@@ -749,6 +779,35 @@ public class DriveRecoveryService {
                         fileInfo.movedFrom = "-";
                         fileInfo.currentStatus = new CurrentStatus("NESTED", "ℹ️ NESTED IN BATCH", "-", false);
                         ptf.log("  │                  │    ↳ ℹ️  Nested — bỏ qua", ProgressTracker.LogLevel.INFO);
+                        // ⭐ FIX: Nếu parent thật là folder ALIVE -> checkFolder(parent)
+                        String actualParentId = queryLastKnownParent_Layer1(fileHistory.id);
+                        if (actualParentId != null
+                                && !batchDeletedFileIds.contains(actualParentId)
+                                && processedFolderIds.add(actualParentId)) {
+                            try {
+                                com.google.api.services.drive.model.File pMeta2 = driveService.files()
+                                        .get(actualParentId).setFields("id, name, trashed")
+                                        .setSupportsAllDrives(true).execute();
+                                if (pMeta2 != null && !Boolean.TRUE.equals(pMeta2.getTrashed())) {
+                                    ptf.log("  │  [LIVE-PARENT] " + pMeta2.getName()
+                                            + " -> checkFolder đệ quy", ProgressTracker.LogLevel.INFO);
+                                    FolderInfo liveParent2 = new FolderInfo();
+                                    liveParent2.id = actualParentId;
+                                    liveParent2.name = pMeta2.getName();
+                                    liveParent2.path = folder.path + "/" + pMeta2.getName();
+                                    try {
+                                        FolderReport sr2 = checkFolder(liveParent2, userEmail);
+                                        allReports.add(sr2);
+                                    } catch (Exception exLP) {
+                                        ptf.log("  ⚠️ checkFolder live-parent lỗi: " + exLP.getMessage(),
+                                                ProgressTracker.LogLevel.WARNING);
+                                    }
+                                }
+                            } catch (Exception exLP) {
+                                ptf.log("  ⚠️ Verify parent " + actualParentId + " lỗi: " + exLP.getMessage(),
+                                        ProgressTracker.LogLevel.WARNING);
+                            }
+                        }
                     } else if (resolution == ParentResolution.CONFIRMED_DIRECT) {
                         ptf.log("  │                  │    ↳ ✅ Direct child → verify Drive API",
                                 ProgressTracker.LogLevel.INFO);
