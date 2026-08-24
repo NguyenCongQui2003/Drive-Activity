@@ -425,6 +425,12 @@ public class DriveRecoveryService {
                 pt.log("  ├─────────┼────────────────────────────────────────────────────",
                         ProgressTracker.LogLevel.INFO);
 
+                // ⭐ Layer-2: pre-compute batch deleted folder IDs
+                java.util.Set<String> batchDeletedFolderIds = mergedFolders.stream()
+                        .filter(h -> h.deletedFromSubtree && !h.everInFolder)
+                        .map(h -> h.id)
+                        .collect(java.util.stream.Collectors.toSet());
+
                 for (FileHistory fh : mergedFolders) {
                     SubFolderInfo sfInfo = new SubFolderInfo();
                     sfInfo.folderName = fh.name;
@@ -451,99 +457,109 @@ public class DriveRecoveryService {
                                 ProgressTracker.LogLevel.INFO);
 
                     } else if (fh.deletedFromSubtree && !fh.everInFolder) {
-                        // ── BỊ XÓA qua DELETE event ──
-                        // Không biết chắc là direct child hay grandchild → verify trước.
-                        // Logic:
-                        // • Trong Trash → báo cáo "Trong Thùng rác", KHÔNG move
-                        // • Không Trash → tồn tại nhưng bị move đi → move về đúng folder
-                        // • 404 → đã xóa vĩnh viễn
-                        missingFolderCount++;
-                        sfInfo.status = "Bị xóa";
-                        pt.log("  │  🗑️ DELETE event │  " + fh.name + "  →  đang verify...",
-                                ProgressTracker.LogLevel.WARNING);
-                        try {
-                            com.google.api.services.drive.model.File deletedFolder = null;
-                            boolean verifyFailed = false;
-                            try {
-                                deletedFolder = driveService.files().get(fh.id)
-                                        .setFields("id, name, trashed, explicitlyTrashed, parents, owners, driveId")
-                                        .setSupportsAllDrives(true)
-                                        .execute();
-                            } catch (com.google.api.client.googleapis.json.GoogleJsonResponseException gje) {
-                                verifyFailed = true;
-                                if (gje.getStatusCode() == 404) {
-                                    sfInfo.status = "Đã xóa vĩnh viễn";
-                                    sfInfo.action = "Đã xóa vĩnh viễn khỏi Drive";
-                                    sfInfo.movedFrom = "-";
-                                    pt.log("  │           │    ↳ ❌ Đã xóa vĩnh viễn (404)",
-                                            ProgressTracker.LogLevel.WARNING);
-                                } else {
-                                    sfInfo.action = "Lỗi verify: HTTP " + gje.getStatusCode();
-                                    sfInfo.movedFrom = "-";
-                                    pt.log("  │           │    ↳ ⚠️  Lỗi HTTP " + gje.getStatusCode(),
-                                            ProgressTracker.LogLevel.WARNING);
-                                }
-                            }
-
-                            if (!verifyFailed && deletedFolder != null) {
-                                boolean inTrash = Boolean.TRUE.equals(deletedFolder.getTrashed())
-                                        || Boolean.TRUE.equals(deletedFolder.getExplicitlyTrashed());
-
-                                if (inTrash) {
-                                    // ── TRONG TRASH → chỉ báo cáo, KHÔNG move ──
-                                    String ownerInfo = (deletedFolder.getOwners() != null
-                                            && !deletedFolder.getOwners().isEmpty())
-                                                    ? deletedFolder.getOwners().get(0).getEmailAddress()
-                                                    : "unknown";
-                                    sfInfo.status = "Trong Thùng rác";
-                                    sfInfo.action = "Đang trong Thùng rác — không tự động move";
-                                    sfInfo.movedFrom = "Trash (owner: " + ownerInfo + ")";
-                                    pt.log("  │           │    ↳ 🗑️  Folder đang trong TRASH của " + ownerInfo
-                                            + " — bỏ qua, không move", ProgressTracker.LogLevel.WARNING);
-
-                                } else {
-                                    // ── KHÔNG TRONG TRASH → folder vẫn còn, move về đúng folder ──
-                                    pt.log("  │           │    ↳ ✅ Folder vẫn tồn tại (không trong Trash) → đang move về...",
-                                            ProgressTracker.LogLevel.INFO);
-                                    MoveResult mr = findAndMoveFolderWithResult(fh, folder.id, folder.path, userEmail);
-                                    sfInfo.status = mr.success ? "Đã move về" : "Thiếu";
-                                    sfInfo.action = mr.success ? "Đã move" : "Không move được: " + mr.reason;
-                                    sfInfo.movedFrom = mr.movedFrom != null ? mr.movedFrom : "-";
-
-                                    if (mr.success) {
-                                        pt.log("  │           │    ↳ ✅ Move thành công từ: " + sfInfo.movedFrom,
-                                                ProgressTracker.LogLevel.SUCCESS);
-                                    } else {
-                                        pt.log("  │           │    ↳ ⚠️  " + mr.reason,
+                        // ── BỊ XÓA qua DELETE event — 3-layer resolution ──
+                        if ("PERMANENT_DELETE".equals(fh.deleteType)) {
+                            missingFolderCount++;
+                            sfInfo.status = "Đã xóa vĩnh viễn";
+                            sfInfo.action = "Permanent delete — không thể phục hồi";
+                            sfInfo.movedFrom = "-";
+                            pt.log("  │  ❌ Xóa vĩnh viễn │  " + fh.name + "  (PERMANENT_DELETE — bỏ qua)",
+                                    ProgressTracker.LogLevel.WARNING);
+                        } else {
+                            missingFolderCount++;
+                            sfInfo.status = "Bị xóa";
+                            pt.log("  │  🗑️ DELETE event │  " + fh.name + "  →  đang resolve parent...",
+                                    ProgressTracker.LogLevel.WARNING);
+                            java.util.Set<String> otherIds = batchDeletedFolderIds.stream()
+                                    .filter(id -> !id.equals(fh.id))
+                                    .collect(java.util.stream.Collectors.toSet());
+                            ParentResolution resolution = resolveTrueParent(fh.id, folder.id, otherIds);
+                            if (resolution == ParentResolution.NESTED_IN_BATCH) {
+                                sfInfo.status = "Trong subfolder khác";
+                                sfInfo.action = "Không move — xác nhận nằm trong subfolder đã bị xóa";
+                                sfInfo.movedFrom = "-";
+                                pt.log("  │           │    ↳ ℹ️  Nested — bỏ qua, không flatten",
+                                        ProgressTracker.LogLevel.INFO);
+                            } else if (resolution == ParentResolution.CONFIRMED_DIRECT) {
+                                pt.log("  │           │    ↳ ✅ Direct child → verify Drive API",
+                                        ProgressTracker.LogLevel.INFO);
+                                try {
+                                    com.google.api.services.drive.model.File deletedFolder = null;
+                                    boolean verifyFailed = false;
+                                    try {
+                                        deletedFolder = driveService.files().get(fh.id)
+                                                .setFields("id, name, trashed, explicitlyTrashed, parents, owners, driveId")
+                                                .setSupportsAllDrives(true).execute();
+                                    } catch (com.google.api.client.googleapis.json.GoogleJsonResponseException gje) {
+                                        verifyFailed = true;
+                                        sfInfo.status = gje.getStatusCode() == 404 ? "Đã xóa vĩnh viễn" : "Lỗi verify";
+                                        sfInfo.action = gje.getStatusCode() == 404 ? "404 — không thể phục hồi"
+                                                : "Lỗi verify: HTTP " + gje.getStatusCode();
+                                        sfInfo.movedFrom = "-";
+                                        pt.log("  │           │    ↳ " + (gje.getStatusCode() == 404
+                                                ? "❌ 404 — đã xóa vĩnh viễn" : "⚠️  Lỗi HTTP " + gje.getStatusCode()),
                                                 ProgressTracker.LogLevel.WARNING);
                                     }
-
-                                    // Đệ quy kiểm tra bên trong nếu move thành công
-                                    if (mr.actuallyMoved && processedFolderIds.add(fh.id)) {
-                                        FolderInfo restoredFolder = new FolderInfo();
-                                        restoredFolder.id = fh.id;
-                                        restoredFolder.name = fh.name;
-                                        restoredFolder.path = folder.path + "/" + fh.name;
-                                        try {
-                                            pt.log("  🔄 Đệ quy kiểm tra folder vừa restore: " + restoredFolder.path,
+                                    if (!verifyFailed && deletedFolder != null) {
+                                        boolean inTrash = Boolean.TRUE.equals(deletedFolder.getTrashed())
+                                                || Boolean.TRUE.equals(deletedFolder.getExplicitlyTrashed());
+                                        String ownerInfo = (deletedFolder.getOwners() != null
+                                                && !deletedFolder.getOwners().isEmpty())
+                                                        ? deletedFolder.getOwners().get(0).getEmailAddress() : "unknown";
+                                        if (inTrash) {
+                                            List<String> curParents = deletedFolder.getParents() != null
+                                                    ? deletedFolder.getParents() : java.util.List.of();
+                                            boolean restored = restoreFromTrashAndMove(fh.id, curParents, folder.id);
+                                            if (restored) {
+                                                sfInfo.status = "Đã restore";
+                                                sfInfo.action = "Restore từ Trash → move về " + folder.path;
+                                                sfInfo.movedFrom = "Trash (" + ownerInfo + ")";
+                                                pt.log("  │           │    ↳ ✅ Restore từ Trash thành công",
+                                                        ProgressTracker.LogLevel.SUCCESS);
+                                                globalRecoveredIds.add(fh.id);
+                                                if (processedFolderIds.add(fh.id)) {
+                                                    FolderInfo ri = new FolderInfo();
+                                                    ri.id = fh.id; ri.name = fh.name;
+                                                    ri.path = folder.path + "/" + fh.name;
+                                                    try { FolderReport sr = checkFolder(ri, userEmail); allReports.add(sr); }
+                                                    catch (Exception ex) { pt.log("  ⚠️ Lỗi đệ quy: " + ex.getMessage(), ProgressTracker.LogLevel.WARNING); }
+                                                }
+                                            } else {
+                                                sfInfo.status = "Trong Thùng rác";
+                                                sfInfo.action = "Không restore được — cần xử lý thủ công";
+                                                sfInfo.movedFrom = "Trash (" + ownerInfo + ")";
+                                                pt.log("  │           │    ↳ ⚠️  Restore thất bại",
+                                                        ProgressTracker.LogLevel.WARNING);
+                                            }
+                                        } else {
+                                            pt.log("  │           │    ↳ ✅ Folder vẫn tồn tại → move về...",
                                                     ProgressTracker.LogLevel.INFO);
-                                            FolderReport subReport = checkFolder(restoredFolder, userEmail);
-                                            allReports.add(subReport);
-                                            pt.log("  ✅ Hoàn thành kiểm tra sâu: " + restoredFolder.path,
-                                                    ProgressTracker.LogLevel.SUCCESS);
-                                        } catch (Exception ex) {
-                                            pt.log("  ⚠️ Lỗi đệ quy checkFolder(" + fh.name + "): " + ex.getMessage(),
-                                                    ProgressTracker.LogLevel.WARNING);
+                                            MoveResult mr = findAndMoveFolderWithResult(fh, folder.id, folder.path, userEmail);
+                                            sfInfo.status = mr.success ? "Đã move về" : "Thiếu";
+                                            sfInfo.action = mr.success ? "Đã move" : "Không move được: " + mr.reason;
+                                            sfInfo.movedFrom = mr.movedFrom != null ? mr.movedFrom : "-";
+                                            if (mr.actuallyMoved && processedFolderIds.add(fh.id)) {
+                                                FolderInfo ri = new FolderInfo();
+                                                ri.id = fh.id; ri.name = fh.name;
+                                                ri.path = folder.path + "/" + fh.name;
+                                                try { FolderReport sr = checkFolder(ri, userEmail); allReports.add(sr); }
+                                                catch (Exception ex) { pt.log("  ⚠️ Lỗi đệ quy: " + ex.getMessage(), ProgressTracker.LogLevel.WARNING); }
+                                            }
                                         }
                                     }
+                                } catch (Exception e) {
+                                    sfInfo.action = "Lỗi: " + e.getMessage(); sfInfo.movedFrom = "-";
+                                    pt.log("  │           │    ↳ ❌ Lỗi: " + e.getMessage(), ProgressTracker.LogLevel.ERROR);
                                 }
+                            } else {
+                                sfInfo.status = "Không xác định parent";
+                                sfInfo.action = "Cần review thủ công — Không đủ event xác định folder cha";
+                                sfInfo.movedFrom = "-";
+                                pt.log("  │           │    ↳ ❓ UNKNOWN — Phương án A: không move",
+                                        ProgressTracker.LogLevel.WARNING);
                             }
-                        } catch (Exception e) {
-                            sfInfo.action = "Lỗi: " + e.getMessage();
-                            sfInfo.movedFrom = "-";
-                            pt.log("  │           │    ↳ ❌ Lỗi xử lý: " + e.getMessage(),
-                                    ProgressTracker.LogLevel.ERROR);
                         }
+
 
                     } else {
                         // ── THIẾU: không ở direct child, không ở subtree → cần tìm & move về ──
@@ -672,6 +688,12 @@ public class DriveRecoveryService {
         ptf.log("  │  Trạng thái      │  Tên File", ProgressTracker.LogLevel.INFO);
         ptf.log("  ├──────────────────┼──────────────────────────────────────────", ProgressTracker.LogLevel.INFO);
 
+        // ⭐ Layer-2: pre-compute batch deleted file IDs
+        java.util.Set<String> batchDeletedFileIds = mergedFiles.stream()
+                .filter(h -> h.deletedFromSubtree && !h.everInFolder)
+                .map(h -> h.id)
+                .collect(java.util.stream.Collectors.toSet());
+
         for (FileHistory fileHistory : mergedFiles) {
             FileInfo fileInfo = new FileInfo();
             fileInfo.fileName = fileHistory.name;
@@ -702,92 +724,113 @@ public class DriveRecoveryService {
                 continue;
             }
 
-            // CASE 2.5: File bị DELETE qua DELETE event — chưa confirm là direct child
-            // Logic: Trash → báo cáo; không Trash → move về; 404 → xóa vĩnh viễn
+            // CASE 2.5: File bị DELETE qua DELETE event — 3-layer resolution
             if (fileHistory.deletedFromSubtree && !fileHistory.everInFolder) {
-                missingCount++;
-                fileInfo.status = "Bị xóa";
-                ptf.log("  │  🗑️ DELETE event    │  " + fileHistory.name + "  →  đang verify...",
-                        ProgressTracker.LogLevel.WARNING);
-                try {
-                    com.google.api.services.drive.model.File deletedFile = null;
-                    boolean verifyFailed = false;
-                    try {
-                        deletedFile = driveService.files().get(fileHistory.id)
-                                .setFields("id, name, trashed, explicitlyTrashed, parents, owners")
-                                .setSupportsAllDrives(true)
-                                .execute();
-                    } catch (com.google.api.client.googleapis.json.GoogleJsonResponseException gje) {
-                        verifyFailed = true;
-                        if (gje.getStatusCode() == 404) {
-                            fileInfo.status = "Đã xóa vĩnh viễn";
-                            fileInfo.action = "Đã xóa vĩnh viễn khỏi Drive";
-                            fileInfo.movedFrom = "-";
-                            fileInfo.currentStatus = new CurrentStatus("DELETED", "❌ PERMANENTLY DELETED", "-", false);
-                            ptf.log("  │                  │    ↳ ❌ Đã xóa vĩnh viễn (404)",
-                                    ProgressTracker.LogLevel.WARNING);
-                        } else {
-                            fileInfo.action = "Lỗi verify: HTTP " + gje.getStatusCode();
-                            fileInfo.movedFrom = "-";
-                            fileInfo.currentStatus = getCurrentFileStatus(fileHistory.id);
-                            ptf.log("  │                  │    ↳ ⚠️  HTTP " + gje.getStatusCode(),
-                                    ProgressTracker.LogLevel.WARNING);
-                        }
-                    }
-
-                    if (!verifyFailed && deletedFile != null) {
-                        boolean inTrash = Boolean.TRUE.equals(deletedFile.getTrashed())
-                                || Boolean.TRUE.equals(deletedFile.getExplicitlyTrashed());
-
-                        if (inTrash) {
-                            // ── TRONG TRASH → chỉ báo cáo, KHÔNG move ──
-                            String ownerInfo = (deletedFile.getOwners() != null && !deletedFile.getOwners().isEmpty())
-                                    ? deletedFile.getOwners().get(0).getEmailAddress()
-                                    : "unknown";
-                            fileInfo.status = "Trong Thùng rác";
-                            fileInfo.action = "Đang trong Thùng rác — không tự động move";
-                            fileInfo.movedFrom = "Trash (owner: " + ownerInfo + ")";
-                            fileInfo.currentStatus = new CurrentStatus("TRASHED", "🗑️ IN TRASH",
-                                    "Trash (" + ownerInfo + ")", true);
-                            ptf.log("  │                  │    ↳ 🗑️  File trong TRASH của " + ownerInfo
-                                    + " — bỏ qua, không move", ProgressTracker.LogLevel.WARNING);
-                        } else {
-                            // ── KHÔNG TRONG TRASH → tồn tại, move về ──
-                            ptf.log("  │                  │    ↳ ✅ File vẫn tồn tại (không trong Trash) → đang move về...",
-                                    ProgressTracker.LogLevel.INFO);
-                            MoveResult mr = findAndMoveFileWithResult(fileHistory, folder.id, folder.path, userEmail,
-                                    subfolderIds);
-                            fileInfo.movedFrom = mr.movedFrom != null ? mr.movedFrom : "-";
-
-                            if (mr.inTrash) {
-                                fileInfo.status = "Trong Thùng rác";
-                                fileInfo.action = "Đang trong Thùng rác — không tự động move";
-                                fileInfo.currentStatus = new CurrentStatus("TRASHED", "🗑️ IN TRASH",
-                                        fileInfo.movedFrom, true);
-                                ptf.log("  │                  │    ↳ 🗑️  File trong TRASH — bỏ qua",
-                                        ProgressTracker.LogLevel.WARNING);
-                            } else if (mr.success) {
-                                fileInfo.status = "Đã move về";
-                                fileInfo.action = "Đã move";
-                                fileInfo.currentStatus = new CurrentStatus("MOVED", "✅ ĐÃ MOVE VỀ ĐÚNG CHỖ",
-                                        folder.path, false);
-                                ptf.log("  │                  │    ↳ ✅ Move thành công từ: " + fileInfo.movedFrom,
-                                        ProgressTracker.LogLevel.SUCCESS);
-                            } else {
-                                fileInfo.status = "Thiếu";
-                                fileInfo.action = "Không move được: " + mr.reason;
-                                fileInfo.currentStatus = getCurrentFileStatus(fileHistory.id);
-                                ptf.log("  │                  │    ↳ ⚠️  " + mr.reason,
+                if ("PERMANENT_DELETE".equals(fileHistory.deleteType)) {
+                    missingCount++;
+                    fileInfo.status = "Đã xóa vĩnh viễn";
+                    fileInfo.action = "Permanent delete — không thể phục hồi";
+                    fileInfo.movedFrom = "-";
+                    fileInfo.currentStatus = new CurrentStatus("DELETED", "❌ PERMANENTLY DELETED", "-", false);
+                    ptf.log("  │  ❌ Xóa vĩnh viễn     │  " + fileHistory.name + "  (PERMANENT_DELETE — bỏ qua)",
+                            ProgressTracker.LogLevel.WARNING);
+                } else {
+                    missingCount++;
+                    fileInfo.status = "Bị xóa";
+                    ptf.log("  │  🗑️ DELETE event    │  " + fileHistory.name + "  →  đang resolve parent...",
+                            ProgressTracker.LogLevel.WARNING);
+                    java.util.Set<String> otherIds = batchDeletedFileIds.stream()
+                            .filter(id -> !id.equals(fileHistory.id))
+                            .collect(java.util.stream.Collectors.toSet());
+                    ParentResolution resolution = resolveTrueParent(fileHistory.id, folder.id, otherIds);
+                    if (resolution == ParentResolution.NESTED_IN_BATCH) {
+                        fileInfo.status = "Trong subfolder khác";
+                        fileInfo.action = "Không move — xác nhận nằm trong subfolder đã bị xóa";
+                        fileInfo.movedFrom = "-";
+                        fileInfo.currentStatus = new CurrentStatus("NESTED", "ℹ️ NESTED IN BATCH", "-", false);
+                        ptf.log("  │                  │    ↳ ℹ️  Nested — bỏ qua", ProgressTracker.LogLevel.INFO);
+                    } else if (resolution == ParentResolution.CONFIRMED_DIRECT) {
+                        ptf.log("  │                  │    ↳ ✅ Direct child → verify Drive API",
+                                ProgressTracker.LogLevel.INFO);
+                        try {
+                            com.google.api.services.drive.model.File deletedFile = null;
+                            boolean verifyFailed = false;
+                            try {
+                                deletedFile = driveService.files().get(fileHistory.id)
+                                        .setFields("id, name, trashed, explicitlyTrashed, parents, owners")
+                                        .setSupportsAllDrives(true).execute();
+                            } catch (com.google.api.client.googleapis.json.GoogleJsonResponseException gje) {
+                                verifyFailed = true;
+                                if (gje.getStatusCode() == 404) {
+                                    fileInfo.status = "Đã xóa vĩnh viễn";
+                                    fileInfo.action = "404 — không thể phục hồi";
+                                    fileInfo.movedFrom = "-";
+                                    fileInfo.currentStatus = new CurrentStatus("DELETED", "❌ PERMANENTLY DELETED", "-", false);
+                                } else {
+                                    fileInfo.action = "Lỗi verify: HTTP " + gje.getStatusCode();
+                                    fileInfo.movedFrom = "-";
+                                    fileInfo.currentStatus = getCurrentFileStatus(fileHistory.id);
+                                }
+                                ptf.log("  │                  │    ↳ ⚠️  HTTP " + gje.getStatusCode(),
                                         ProgressTracker.LogLevel.WARNING);
                             }
+                            if (!verifyFailed && deletedFile != null) {
+                                boolean inTrash = Boolean.TRUE.equals(deletedFile.getTrashed())
+                                        || Boolean.TRUE.equals(deletedFile.getExplicitlyTrashed());
+                                String ownerInfo = (deletedFile.getOwners() != null && !deletedFile.getOwners().isEmpty())
+                                        ? deletedFile.getOwners().get(0).getEmailAddress() : "unknown";
+                                if (inTrash) {
+                                    List<String> curParents = deletedFile.getParents() != null
+                                            ? deletedFile.getParents() : java.util.List.of();
+                                    boolean restored = restoreFromTrashAndMove(fileHistory.id, curParents, folder.id);
+                                    if (restored) {
+                                        fileInfo.status = "Đã restore";
+                                        fileInfo.action = "Restore từ Trash → move về " + folder.path;
+                                        fileInfo.movedFrom = "Trash (" + ownerInfo + ")";
+                                        fileInfo.currentStatus = new CurrentStatus("MOVED", "✅ ĐÃ RESTORE & MOVE", folder.path, false);
+                                        ptf.log("  │                  │    ↳ ✅ Restore từ Trash thành công",
+                                                ProgressTracker.LogLevel.SUCCESS);
+                                    } else {
+                                        fileInfo.status = "Trong Thùng rác";
+                                        fileInfo.action = "Không restore được";
+                                        fileInfo.movedFrom = "Trash (" + ownerInfo + ")";
+                                        fileInfo.currentStatus = new CurrentStatus("TRASHED", "🗑️ IN TRASH", fileInfo.movedFrom, true);
+                                        ptf.log("  │                  │    ↳ ⚠️  Restore thất bại",
+                                                ProgressTracker.LogLevel.WARNING);
+                                    }
+                                } else {
+                                    MoveResult mr = findAndMoveFileWithResult(fileHistory, folder.id, folder.path, userEmail, subfolderIds);
+                                    fileInfo.movedFrom = mr.movedFrom != null ? mr.movedFrom : "-";
+                                    if (mr.success) {
+                                        fileInfo.status = "Đã move về";
+                                        fileInfo.action = "Đã move";
+                                        fileInfo.currentStatus = new CurrentStatus("MOVED", "✅ ĐÃ MOVE VỀ ĐÚNG CHỖ", folder.path, false);
+                                        ptf.log("  │                  │    ↳ ✅ Move thành công từ: " + fileInfo.movedFrom,
+                                                ProgressTracker.LogLevel.SUCCESS);
+                                    } else {
+                                        fileInfo.status = "Thiếu";
+                                        fileInfo.action = "Không move được: " + mr.reason;
+                                        fileInfo.currentStatus = getCurrentFileStatus(fileHistory.id);
+                                        ptf.log("  │                  │    ↳ ⚠️  " + mr.reason,
+                                                ProgressTracker.LogLevel.WARNING);
+                                    }
+                                }
+                            }
+                        } catch (Exception e) {
+                            fileInfo.action = "Lỗi: " + e.getMessage();
+                            fileInfo.movedFrom = "-";
+                            fileInfo.currentStatus = getCurrentFileStatus(fileHistory.id);
+                            ptf.log("  │                  │    ↳ ❌ Lỗi: " + e.getMessage(),
+                                    ProgressTracker.LogLevel.ERROR);
                         }
+                    } else {
+                        fileInfo.status = "Không xác định parent";
+                        fileInfo.action = "Cần review thủ công — Không đủ event xác định folder cha";
+                        fileInfo.movedFrom = "-";
+                        fileInfo.currentStatus = new CurrentStatus("UNKNOWN", "❓ KHÔNG XÁC ĐỊNH PARENT", "-", false);
+                        ptf.log("  │                  │    ↳ ❓ UNKNOWN — Phương án A: không move",
+                                ProgressTracker.LogLevel.WARNING);
                     }
-                } catch (Exception e) {
-                    fileInfo.action = "Lỗi: " + e.getMessage();
-                    fileInfo.movedFrom = "-";
-                    fileInfo.currentStatus = getCurrentFileStatus(fileHistory.id);
-                    ptf.log("  │                  │    ↳ ❌ Lỗi xử lý: " + e.getMessage(),
-                            ProgressTracker.LogLevel.ERROR);
                 }
                 report.files.add(fileInfo);
                 continue;
@@ -2358,49 +2401,9 @@ public class DriveRecoveryService {
             boolean addedToFolder = false;
             boolean removedFromFolder = false;
             boolean deletedFlag = false; // ⭐ FIX: track DELETE event separately
+            String deleteTypeLocal = null; // ⭐ NEW
 
             for (ActionDetail detail : allActions) {
-                // ⭐ CREATE — xử lý giống folder: verify parent bằng Drive API
-                // ancestorName trả về cả subtree → phải check parents thực tế
-                // Bắt: file upload trực tiếp vào folder (không qua MOVE)
-                if (detail.getCreate() != null) {
-                    try {
-                        com.google.api.services.drive.model.File fileMeta = driveService.files().get(fileId)
-                                .setFields("parents, trashed")
-                                .setSupportsAllDrives(true)
-                                .execute();
-                        if (fileMeta.getParents() != null
-                                && fileMeta.getParents().contains(folderId)
-                                && (fileMeta.getTrashed() == null || !fileMeta.getTrashed())) {
-                            addedToFolder = true;
-                        }
-                    } catch (com.google.api.client.googleapis.json.GoogleJsonResponseException gje) {
-                        if (gje.getStatusCode() == 404) {
-                            // File bị xóa vĩnh viễn → không verify được parents.
-                            // ⚠️ QUAN TRỌNG: ancestorName query trả về TOÀN BỘ subtree.
-                            // File 404 này có thể từng tạo trong D (cháu của B), không phải
-                            // trực tiếp trong B. Không thể verify → KHÔNG set addedToFolder=true.
-                            // Chỉ mark permanentlyDeleted để báo cáo, không move.
-                            if (!fileHistoryMap.containsKey(fileId)) {
-                                FileHistory newFh = new FileHistory();
-                                newFh.id = fileId;
-                                newFh.name = fileName;
-                                newFh.everInFolder = true;
-                                newFh.currentlyInFolder = false; // 404 → không thể move
-                                newFh.permanentlyDeleted = true;
-                                newFh.lastSeenTimestamp = timestamp;
-                                fileHistoryMap.put(fileId, newFh);
-                            } else {
-                                fileHistoryMap.get(fileId).permanentlyDeleted = true;
-                                fileHistoryMap.get(fileId).currentlyInFolder = false;
-                            }
-                        }
-                        // HTTP khác (403, 500...) → bỏ qua CREATE này, không đủ info
-                    } catch (Exception ignored) {
-                        // Network/IO lỗi → bỏ qua, không crash
-                    }
-                }
-
                 // ⭐ MOVE
                 if (detail.getMove() != null) {
                     Move move = detail.getMove();
@@ -2424,11 +2427,12 @@ public class DriveRecoveryService {
                     }
                 }
                 // ⭐ FIX: Detect DELETE event cho file
-                // Khi file bị xóa (DELETE): không có addedParents/removedParents
-                // → addedToFolder và removedFromFolder đều false → bị skip ở line bên dưới
-                // Fix: detect DELETE và mark deletedFromSubtree=true để checkFolder biết
                 if (detail.getDelete() != null) {
-                    deletedFlag = true; // ⭐ FIX: chỉ set flag, xử lý SAU guard
+                    deletedFlag = true; // ⭐ FIX
+                    String dtype = detail.getDelete().getType();
+                    if (dtype != null && !dtype.isBlank() && !"TYPE_UNSPECIFIED".equals(dtype)) {
+                        deleteTypeLocal = dtype;
+                    }
                 }
             }
 
@@ -2448,11 +2452,15 @@ public class DriveRecoveryService {
                     newFh.everInFolder = false;
                     newFh.currentlyInFolder = false;
                     newFh.deletedFromSubtree = true;
+                    newFh.deleteType = deleteTypeLocal; // ⭐ NEW
                     newFh.lastSeenTimestamp = timestamp;
                     fileHistoryMap.put(fileId, newFh);
                 } else {
                     fileHistoryMap.get(fileId).currentlyInFolder = false;
                     fileHistoryMap.get(fileId).deletedFromSubtree = true;
+                    if (deleteTypeLocal != null && fileHistoryMap.get(fileId).deleteType == null) {
+                        fileHistoryMap.get(fileId).deleteType = deleteTypeLocal;
+                    }
                 }
             }
 
@@ -2555,50 +2563,9 @@ public class DriveRecoveryService {
             boolean removedFromFolder = false;
             boolean createdInFolder = false;
             boolean deletedFlag = false; // ⭐ FIX: track DELETE event separately
+            String deleteTypeLocal = null; // ⭐ NEW
 
             for (ActionDetail detail : allActions) {
-                // ⭐ FIX: Detect CREATE event cho folder trực tiếp trong folderId
-                // ancestorName query trả về cả subtree → phải verify parent thực sự là folderId
-                // Dùng Drive API để check parents (chấp nhận 1 API call cho CREATE event)
-                if (detail.getCreate() != null) {
-                    try {
-                        com.google.api.services.drive.model.File folderMeta = driveService.files().get(foldItemId)
-                                .setFields("parents, trashed")
-                                .setSupportsAllDrives(true)
-                                .execute();
-                        if (folderMeta.getParents() != null
-                                && folderMeta.getParents().contains(folderId)
-                                && (folderMeta.getTrashed() == null || !folderMeta.getTrashed())) {
-                            createdInFolder = true;
-                        }
-                    } catch (com.google.api.client.googleapis.json.GoogleJsonResponseException gje) {
-                        if (gje.getStatusCode() == 404) {
-                            // Folder bị xóa vĩnh viễn → không verify được parents.
-                            // ⚠️ QUAN TRỌNG: ancestorName query trả về TOÀN BỘ subtree.
-                            // Folder 404 này có thể từng là direct child CỦA BẤT KỲ FOLDER NÀO
-                            // trong subtree — KHÔNG CHỈ folderId. Đánh dấu everInFolder=true
-                            // nhưng currentlyInFolder=false để báo cáo (không move) vì
-                            // không thể xác nhận nó thực sự là direct child của folderId.
-                            if (!map.containsKey(foldItemId)) {
-                                FileHistory newFh = new FileHistory();
-                                newFh.id = foldItemId;
-                                newFh.name = foldItemName;
-                                newFh.everInFolder = true;
-                                newFh.currentlyInFolder = false; // 404 → không thể move
-                                newFh.permanentlyDeleted = true;
-                                newFh.lastSeenTimestamp = timestamp;
-                                map.put(foldItemId, newFh);
-                            } else {
-                                map.get(foldItemId).permanentlyDeleted = true;
-                                map.get(foldItemId).currentlyInFolder = false;
-                            }
-                        }
-                        // HTTP khác (403, 500...) → bỏ qua CREATE này, không đủ info
-                    } catch (Exception ignored) {
-                        // Network/IO lỗi → bỏ qua, không crash
-                    }
-                }
-
                 if (detail.getMove() != null) {
                     Move move = detail.getMove();
                     if (move.getAddedParents() != null) {
@@ -2619,22 +2586,19 @@ public class DriveRecoveryService {
                     }
                 }
                 // ⭐ FIX: Detect DELETE event
-                // Khi folder B bị xóa khỏi folder A (owner là user khác delete):
-                // - Activity API trả về event DELETE cho folder B
-                // - KHÔNG có addedParents/removedParents (vì không phải MOVE)
-                // - Sau khi xóa, không thể gọi Drive API verify parents nữa
-                // → dùng dấu hiệu: query là ancestorName=folderId, nếu có DELETE
-                // thì folder này từng nằm trong subtree của folderId
-                // → cần mark để báo cáo (permanentlyDeleted hoặc in trash)
                 if (detail.getDelete() != null) {
-                    deletedFlag = true; // ⭐ FIX: chỉ set flag, xử lý SAU guard
+                    deletedFlag = true; // ⭐ FIX
+                    String dtype = detail.getDelete().getType();
+                    if (dtype != null && !dtype.isBlank() && !"TYPE_UNSPECIFIED".equals(dtype)) {
+                        deleteTypeLocal = dtype;
+                    }
                 }
             }
 
             // ⭐ FIX: Include deletedFlag trong guard — DELETE-only items vẫn được xử lý.
             // Deepest folder (D) xử lý trước nhờ Collections.reverse() → kéo C về D đúng.
             // Shallower folder (B) chạy sau: C.parents=[D], D∈allDescendantIds(B) → skip.
-            if (!addedToFolder && !removedFromFolder && !createdInFolder && !deletedFlag)
+            if (!addedToFolder && !removedFromFolder && !deletedFlag)
                 continue;
 
             // ⭐ FIX: Handle DELETE SAU guard — deepest folder thắng, shallower bị block
@@ -2646,11 +2610,15 @@ public class DriveRecoveryService {
                     newFh.everInFolder = false;
                     newFh.currentlyInFolder = false;
                     newFh.deletedFromSubtree = true;
+                    newFh.deleteType = deleteTypeLocal; // ⭐ NEW
                     newFh.lastSeenTimestamp = timestamp;
                     map.put(foldItemId, newFh);
                 } else {
                     map.get(foldItemId).currentlyInFolder = false;
                     map.get(foldItemId).deletedFromSubtree = true;
+                    if (deleteTypeLocal != null && map.get(foldItemId).deleteType == null) {
+                        map.get(foldItemId).deleteType = deleteTypeLocal;
+                    }
                 }
             }
 
@@ -2665,16 +2633,6 @@ public class DriveRecoveryService {
             }
 
             FileHistory fh = map.get(foldItemId);
-
-            if (createdInFolder) {
-                // Folder được tạo và hiện vẫn đang trong folderId (đã verify ở trên)
-                fh.everInFolder = true;
-                fh.currentlyInFolder = true;
-                fh.name = foldItemName;
-                if (fh.lastSeenTimestamp == null) {
-                    fh.lastSeenTimestamp = timestamp;
-                }
-            }
 
             if (addedToFolder) {
                 fh.everInFolder = true;
@@ -3596,6 +3554,175 @@ public class DriveRecoveryService {
         sheet.setColumnWidth(6, 6000);
     }
 
+
+    // ============================================
+    // DELETE EVENT 3-LAYER RESOLUTION HELPERS
+    // ============================================
+
+    enum ParentResolution { CONFIRMED_DIRECT, NESTED_IN_BATCH, UNKNOWN }
+
+    private String queryLastKnownParent_Layer1(String itemId) {
+        try {
+            java.util.List<com.google.api.services.driveactivity.v2.model.DriveActivity> activities = new ArrayList<>();
+            String pageToken = null;
+            do {
+                com.google.api.services.driveactivity.v2.model.QueryDriveActivityRequest req =
+                        new com.google.api.services.driveactivity.v2.model.QueryDriveActivityRequest();
+                req.setItemName("items/" + itemId);
+                req.setPageSize(100);
+                if (pageToken != null) req.setPageToken(pageToken);
+                com.google.api.services.driveactivity.v2.model.QueryDriveActivityResponse resp =
+                        executeActivityQueryWithRetry(req);
+                if (resp.getActivities() != null) activities.addAll(resp.getActivities());
+                pageToken = resp.getNextPageToken();
+            } while (pageToken != null);
+            activities.sort((a, b) -> {
+                String ta = a.getTimestamp() != null ? a.getTimestamp() : "";
+                String tb = b.getTimestamp() != null ? b.getTimestamp() : "";
+                return ta.compareTo(tb);
+            });
+            String lastParentId = null;
+            for (com.google.api.services.driveactivity.v2.model.DriveActivity activity : activities) {
+                java.util.List<ActionDetail> acts = new ArrayList<>();
+                if (activity.getPrimaryActionDetail() != null) acts.add(activity.getPrimaryActionDetail());
+                if (activity.getActions() != null) {
+                    for (Action a : activity.getActions()) { if (a.getDetail() != null) acts.add(a.getDetail()); }
+                }
+                for (ActionDetail detail : acts) {
+                    if (detail.getMove() != null && detail.getMove().getAddedParents() != null) {
+                        for (TargetReference parent : detail.getMove().getAddedParents()) {
+                            String pid = extractFileId(parent.getDriveItem().getName());
+                            if (pid != null) lastParentId = pid;
+                        }
+                    }
+                }
+            }
+            return lastParentId;
+        } catch (Exception e) {
+            ProgressTracker.getInstance().log("    [Layer1] ex: " + e.getMessage(), ProgressTracker.LogLevel.DETAIL);
+            return null;
+        }
+    }
+
+    private String findContainerInBatch_Layer2(String itemId, java.util.Set<String> batchDeletedIds) {
+        for (String candidateId : batchDeletedIds) {
+            if (candidateId.equals(itemId)) continue;
+            try {
+                java.util.List<com.google.api.services.driveactivity.v2.model.DriveActivity> activities = new ArrayList<>();
+                String pageToken = null;
+                do {
+                    com.google.api.services.driveactivity.v2.model.QueryDriveActivityRequest req =
+                            new com.google.api.services.driveactivity.v2.model.QueryDriveActivityRequest();
+                    req.setAncestorName("items/" + candidateId);
+                    req.setPageSize(100);
+                    if (pageToken != null) req.setPageToken(pageToken);
+                    com.google.api.services.driveactivity.v2.model.QueryDriveActivityResponse resp =
+                            executeActivityQueryWithRetry(req);
+                    if (resp.getActivities() != null) activities.addAll(resp.getActivities());
+                    pageToken = resp.getNextPageToken();
+                } while (pageToken != null);
+                for (com.google.api.services.driveactivity.v2.model.DriveActivity activity : activities) {
+                    if (activity.getTargets() == null) continue;
+                    for (Target target : activity.getTargets()) {
+                        if (target.getDriveItem() == null) continue;
+                        String tid = extractFileId(target.getDriveItem().getName());
+                        if (itemId.equals(tid)) return candidateId;
+                    }
+                }
+            } catch (Exception ignored) { }
+        }
+        return null;
+    }
+
+    private ParentResolution resolveTrueParent(String itemId, String targetFolderId,
+            java.util.Set<String> batchDeletedIds) {
+        ProgressTracker pt = ProgressTracker.getInstance();
+        String lastParent = queryLastKnownParent_Layer1(itemId);
+        if (lastParent != null) {
+            boolean direct = targetFolderId.equals(lastParent);
+            pt.log("    [Layer1] -> " + (direct ? "DIRECT" : "NESTED"), ProgressTracker.LogLevel.DETAIL);
+            return direct ? ParentResolution.CONFIRMED_DIRECT : ParentResolution.NESTED_IN_BATCH;
+        }
+        if (!batchDeletedIds.isEmpty()) {
+            String container = findContainerInBatch_Layer2(itemId, batchDeletedIds);
+            if (container != null) {
+                pt.log("    [Layer2] nested in: " + container, ProgressTracker.LogLevel.DETAIL);
+                return ParentResolution.NESTED_IN_BATCH;
+            }
+        }
+        String ownerEmail = findOwnerViaReportsApi(itemId, Config.getAdminEmail());
+        if (ownerEmail != null && !ownerEmail.isBlank()) {
+            try {
+                com.google.auth.oauth2.GoogleCredentials ownerCreds;
+                if (Config.isUseJsonFile()) {
+                    ownerCreds = com.google.auth.oauth2.ServiceAccountCredentials
+                            .fromStream(new java.io.FileInputStream(Config.getServiceAccountFile()))
+                            .createScoped(java.util.List.of("https://www.googleapis.com/auth/drive.activity.readonly"))
+                            .createDelegated(ownerEmail);
+                } else {
+                    ownerCreds = com.google.auth.oauth2.ServiceAccountCredentials
+                            .fromStream(new java.io.ByteArrayInputStream(
+                                    createServiceAccountJson().getBytes(java.nio.charset.StandardCharsets.UTF_8)))
+                            .createScoped(java.util.List.of("https://www.googleapis.com/auth/drive.activity.readonly"))
+                            .createDelegated(ownerEmail);
+                }
+                com.google.api.services.driveactivity.v2.DriveActivity ownerSvc =
+                        new com.google.api.services.driveactivity.v2.DriveActivity.Builder(
+                                com.google.api.client.googleapis.javanet.GoogleNetHttpTransport.newTrustedTransport(),
+                                com.google.api.client.json.gson.GsonFactory.getDefaultInstance(),
+                                new com.google.auth.http.HttpCredentialsAdapter(ownerCreds))
+                                .setApplicationName("Drive Recovery Tool v2.0").build();
+                com.google.api.services.driveactivity.v2.model.QueryDriveActivityRequest req =
+                        new com.google.api.services.driveactivity.v2.model.QueryDriveActivityRequest();
+                req.setItemName("items/" + itemId); req.setPageSize(100);
+                com.google.api.services.driveactivity.v2.model.QueryDriveActivityResponse resp =
+                        ownerSvc.activity().query(req).execute();
+                if (resp.getActivities() != null) {
+                    String lp = null;
+                    for (com.google.api.services.driveactivity.v2.model.DriveActivity act : resp.getActivities()) {
+                        java.util.List<ActionDetail> acts = new ArrayList<>();
+                        if (act.getPrimaryActionDetail() != null) acts.add(act.getPrimaryActionDetail());
+                        if (act.getActions() != null) {
+                            for (Action a : act.getActions()) { if (a.getDetail() != null) acts.add(a.getDetail()); }
+                        }
+                        for (ActionDetail d : acts) {
+                            if (d.getMove() != null && d.getMove().getAddedParents() != null) {
+                                for (TargetReference p : d.getMove().getAddedParents()) {
+                                    String pid = extractFileId(p.getDriveItem().getName());
+                                    if (pid != null) lp = pid;
+                                }
+                            }
+                        }
+                    }
+                    if (lp != null) {
+                        boolean direct = targetFolderId.equals(lp);
+                        pt.log("    [Layer3] -> " + (direct ? "DIRECT" : "NESTED"), ProgressTracker.LogLevel.DETAIL);
+                        return direct ? ParentResolution.CONFIRMED_DIRECT : ParentResolution.NESTED_IN_BATCH;
+                    }
+                }
+            } catch (Exception e) {
+                pt.log("    [Layer3] ex: " + e.getMessage(), ProgressTracker.LogLevel.DETAIL);
+            }
+        }
+        return ParentResolution.UNKNOWN;
+    }
+
+    private boolean restoreFromTrashAndMove(String itemId, java.util.List<String> currentParents,
+            String targetFolderId) {
+        try {
+            com.google.api.services.drive.model.File patch = new com.google.api.services.drive.model.File();
+            patch.setTrashed(false);
+            driveService.files().update(itemId, patch).setSupportsAllDrives(true).execute();
+            Thread.sleep(500);
+            MoveResult mr = moveFileToFolder(itemId, currentParents, targetFolderId, driveService);
+            return mr.success;
+        } catch (Exception e) {
+            ProgressTracker.getInstance().log("    restoreFromTrashAndMove failed: " + e.getMessage(),
+                    ProgressTracker.LogLevel.WARNING);
+            return false;
+        }
+    }
+
     // ============================================
     // INNER CLASSES
     // ============================================
@@ -3646,6 +3773,8 @@ public class DriveRecoveryService {
          * → xóa vĩnh viễn.
          */
         boolean deletedFromSubtree;
+        /** "TRASH"/"PERMANENT_DELETE"/null — from detail.getDelete().getType() */
+        String deleteType;
     }
 
     static class FolderReport {
