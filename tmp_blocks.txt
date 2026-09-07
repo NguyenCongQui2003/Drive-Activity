@@ -1,0 +1,25 @@
+=== CREATE1 len=2599 ===
+                // ⭐ CREATE — xử lý giống folder: verify parent bằng Drive API
+                // ancestorName trả về cả subtree → phải check parents thực tế
+                // Bắt: file upload trực t...                   // Network/IO lỗi → bỏ qua, không crash
+                    }
+                }
+
+
+
+=== CREATE2 len=2729 ===
+                // ⭐ FIX: Detect CREATE event cho folder trực tiếp trong folderId
+                // ancestorName query trả về cả subtree → phải verify parent thực sự là folderId
+                // Dù...                   // Network/IO lỗi → bỏ qua, không crash
+                    }
+                }
+
+
+
+=== FOLDER_DELETE len=0 ===
+
+
+=== FILE_DELETE len=5980 ===
+            // CASE 2.5: File bị DELETE qua DELETE event — chưa confirm là direct child
+            // Logic: Trash → báo cáo; không Trash → move về; 404 → xóa vĩnh viễn
+            if (fileHistory.de

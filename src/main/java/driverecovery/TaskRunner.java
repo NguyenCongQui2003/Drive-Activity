@@ -50,11 +50,13 @@ public class TaskRunner extends SwingWorker<Void, String> {
     public static Set<String> loadCompletedUsers(String outputDirectory) {
         Set<String> completed = new LinkedHashSet<>();
         File f = getCheckpointFile(outputDirectory);
-        if (!f.exists()) return completed;
+        if (!f.exists())
+            return completed;
         try (BufferedReader br = new BufferedReader(new FileReader(f, StandardCharsets.UTF_8))) {
             StringBuilder sb = new StringBuilder();
             String line;
-            while ((line = br.readLine()) != null) sb.append(line);
+            while ((line = br.readLine()) != null)
+                sb.append(line);
             String json = sb.toString();
             // Parse "completedUsers": ["a","b","c"]
             int idx = json.indexOf("\"completedUsers\"");
@@ -65,31 +67,37 @@ public class TaskRunner extends SwingWorker<Void, String> {
                     String arr = json.substring(arrStart + 1, arrEnd);
                     for (String part : arr.split(",")) {
                         String email = part.trim().replace("\"", "");
-                        if (!email.isEmpty()) completed.add(email);
+                        if (!email.isEmpty())
+                            completed.add(email);
                     }
                 }
             }
-        } catch (Exception ignored) {}
+        } catch (Exception ignored) {
+        }
         return completed;
     }
 
     /** Đọc mode từ checkpoint */
     public static String loadCheckpointMode(String outputDirectory) {
         File f = getCheckpointFile(outputDirectory);
-        if (!f.exists()) return "1";
+        if (!f.exists())
+            return "1";
         try (BufferedReader br = new BufferedReader(new FileReader(f, StandardCharsets.UTF_8))) {
             StringBuilder sb = new StringBuilder();
             String line;
-            while ((line = br.readLine()) != null) sb.append(line);
+            while ((line = br.readLine()) != null)
+                sb.append(line);
             String json = sb.toString();
             int idx = json.indexOf("\"mode\"");
             if (idx >= 0) {
                 int colon = json.indexOf(':', idx);
                 int q1 = json.indexOf('"', colon);
                 int q2 = json.indexOf('"', q1 + 1);
-                if (q1 >= 0 && q2 > q1) return json.substring(q1 + 1, q2);
+                if (q1 >= 0 && q2 > q1)
+                    return json.substring(q1 + 1, q2);
             }
-        } catch (Exception ignored) {}
+        } catch (Exception ignored) {
+        }
         return "1";
     }
 
@@ -107,7 +115,8 @@ public class TaskRunner extends SwingWorker<Void, String> {
             sb.append("  \"completedUsers\": [");
             boolean first = true;
             for (String u : completedUsers) {
-                if (!first) sb.append(", ");
+                if (!first)
+                    sb.append(", ");
                 sb.append("\"").append(u).append("\"");
                 first = false;
             }
@@ -123,7 +132,8 @@ public class TaskRunner extends SwingWorker<Void, String> {
 
     private void deleteCheckpoint() {
         File f = getCheckpointFile(Config.getOutputDirectory());
-        if (f.exists()) f.delete();
+        if (f.exists())
+            f.delete();
     }
 
     // ============================================
@@ -143,7 +153,7 @@ public class TaskRunner extends SwingWorker<Void, String> {
                 case "2" -> runMode2(pt);
                 case "3" -> runMode3(pt);
                 case "4" -> runMode4(pt);
-                default  -> runMode1(pt);
+                default -> runMode1(pt);
             }
         } catch (StoppedException e) {
             pt.log("\n⛔ Đã dừng theo yêu cầu người dùng.", ProgressTracker.LogLevel.WARNING);
@@ -158,7 +168,8 @@ public class TaskRunner extends SwingWorker<Void, String> {
     @Override
     protected void done() {
         ProgressTracker.getInstance().onComplete();
-        if (onDone != null) onDone.run();
+        if (onDone != null)
+            onDone.run();
     }
 
     // ============================================
@@ -181,13 +192,15 @@ public class TaskRunner extends SwingWorker<Void, String> {
 
         // ⭐ AUTO FETCH allUsersForSearch (giống Mode 2) ─────────────────────────
         // Nếu allUsersForSearch chưa mở rộng toàn tổ chức (chỉ bằng selected users)
-        // → tự động fetch toàn bộ user từ Admin SDK để tìm file/folder thất lạc tốt hơn.
+        // → tự động fetch toàn bộ user từ Admin SDK để tìm file/folder thất lạc tốt
+        // hơn.
         String adminEmail = appConfig.adminEmail;
         java.util.List<String> searchList = new java.util.ArrayList<>(Config.getAllUsersForSearch());
 
         // Đảm bảo selected users + admin luôn có trong list
         for (String u : users) {
-            if (!searchList.contains(u)) searchList.add(u);
+            if (!searchList.contains(u))
+                searchList.add(u);
         }
         if (adminEmail != null && !adminEmail.isBlank() && !searchList.contains(adminEmail)) {
             searchList.add(adminEmail);
@@ -204,23 +217,22 @@ public class TaskRunner extends SwingWorker<Void, String> {
                         .createScoped(List.of("https://www.googleapis.com/auth/admin.directory.user.readonly"))
                         .createDelegated(adminEmail);
 
-                com.google.api.services.directory.Directory adminSdk =
-                        new com.google.api.services.directory.Directory.Builder(
-                                GoogleNetHttpTransport.newTrustedTransport(),
-                                GsonFactory.getDefaultInstance(),
-                                new HttpCredentialsAdapter(creds))
-                                .setApplicationName("Drive Recovery Tool v2.0")
-                                .build();
+                com.google.api.services.directory.Directory adminSdk = new com.google.api.services.directory.Directory.Builder(
+                        GoogleNetHttpTransport.newTrustedTransport(),
+                        GsonFactory.getDefaultInstance(),
+                        new HttpCredentialsAdapter(creds))
+                        .setApplicationName("Drive Recovery Tool v2.0")
+                        .build();
 
                 String pageToken = null;
                 int fetched = 0;
                 do {
-                    com.google.api.services.directory.Directory.Users.List req =
-                            adminSdk.users().list()
-                                    .setCustomer("my_customer")
-                                    .setMaxResults(500)
-                                    .setOrderBy("email");
-                    if (pageToken != null) req.setPageToken(pageToken);
+                    com.google.api.services.directory.Directory.Users.List req = adminSdk.users().list()
+                            .setCustomer("my_customer")
+                            .setMaxResults(500)
+                            .setOrderBy("email");
+                    if (pageToken != null)
+                        req.setPageToken(pageToken);
                     com.google.api.services.directory.model.Users usersResult = req.execute();
                     if (usersResult.getUsers() != null) {
                         for (com.google.api.services.directory.model.User u : usersResult.getUsers()) {
@@ -246,7 +258,8 @@ public class TaskRunner extends SwingWorker<Void, String> {
                     ProgressTracker.LogLevel.INFO);
         }
 
-        // Inject search list vào Config để findAndMoveFile/FolderWithResult dùng trong suốt Mode 1
+        // Inject search list vào Config để findAndMoveFile/FolderWithResult dùng trong
+        // suốt Mode 1
         appConfig.allUsersForSearch = searchList;
         Config.applyFromAppConfig(appConfig);
         pt.log("👥 Search list (" + searchList.size() + " user): sẵn sàng tìm kiếm toàn tổ chức",
@@ -312,10 +325,11 @@ public class TaskRunner extends SwingWorker<Void, String> {
         // (Admin có thể thấy mọi folder trong tổ chức, kể cả Shared Drive)
         pt.log("🔍 Đang xác định owner + tên folder bằng admin " + adminEmail + "...", ProgressTracker.LogLevel.INFO);
         String ownerEmail = adminEmail; // fallback nếu không detect được
-        String folderName  = folderId;  // fallback tên = ID nếu không lấy được
+        String folderName = folderId; // fallback tên = ID nếu không lấy được
         boolean ownerDetected = false;
 
-        // Nếu user đã chọn sẵn email trong UI → ưu tiên dùng (có thể override sau nếu admin detect được)
+        // Nếu user đã chọn sẵn email trong UI → ưu tiên dùng (có thể override sau nếu
+        // admin detect được)
         if (appConfig.selectedUsers != null && !appConfig.selectedUsers.isEmpty()) {
             ownerEmail = appConfig.selectedUsers.get(0);
             pt.log("👤 Dùng user được chọn trong UI: " + ownerEmail, ProgressTracker.LogLevel.INFO);
@@ -334,7 +348,8 @@ public class TaskRunner extends SwingWorker<Void, String> {
                 folderName = folderMeta.getName();
                 pt.log("📁 Tên folder: " + folderName, ProgressTracker.LogLevel.INFO);
             } else {
-                pt.log("⚠️ Admin fetch được metadata nhưng tên folder rỗng — có thể folder bị ẩn hoặc không có quyền xem tên", ProgressTracker.LogLevel.WARNING);
+                pt.log("⚠️ Admin fetch được metadata nhưng tên folder rỗng — có thể folder bị ẩn hoặc không có quyền xem tên",
+                        ProgressTracker.LogLevel.WARNING);
             }
 
             // Trường hợp My Drive: lấy owner từ metadata
@@ -346,59 +361,65 @@ public class TaskRunner extends SwingWorker<Void, String> {
                     pt.log("👤 Owner (My Drive): " + ownerEmail, ProgressTracker.LogLevel.SUCCESS);
                 }
             }
-            // Trường hợp Shared Drive: owners = null → dùng selectedUsers (đã set ở trên) hoặc admin
+            // Trường hợp Shared Drive: owners = null → dùng selectedUsers (đã set ở trên)
+            // hoặc admin
             else if (folderMeta.getDriveId() != null && !folderMeta.getDriveId().isBlank()) {
                 pt.log("ℹ️  Folder trong Shared Drive: " + folderMeta.getDriveId()
                         + " → impersonate: " + ownerEmail, ProgressTracker.LogLevel.WARNING);
             } else if (!ownerDetected) {
-                pt.log("⚠️ Không tìm được owner từ metadata và không có user nào được chọn trong UI", ProgressTracker.LogLevel.WARNING);
+                pt.log("⚠️ Không tìm được owner từ metadata và không có user nào được chọn trong UI",
+                        ProgressTracker.LogLevel.WARNING);
             }
 
         } catch (Exception e) {
-            pt.log("⚠️ Không fetch được folder metadata qua admin: " + e.getMessage(), ProgressTracker.LogLevel.WARNING);
+            pt.log("⚠️ Không fetch được folder metadata qua admin: " + e.getMessage(),
+                    ProgressTracker.LogLevel.WARNING);
             if (!ownerDetected) {
-                pt.log("⚠️ Chưa detect được owner → sẽ thử lần lượt từng user trong selectedUsers để tìm ai có quyền đọc folder", ProgressTracker.LogLevel.WARNING);
+                pt.log("⚠️ Chưa detect được owner → sẽ thử lần lượt từng user trong selectedUsers để tìm ai có quyền đọc folder",
+                        ProgressTracker.LogLevel.WARNING);
             }
         }
 
         // ⭐ FIX: Nếu chưa detect được owner → dùng Reports API thay vì thử từng user
-        // Vòng 2:  Reports API → tìm ownerEmail của folderId → impersonate owner
-        // Vòng 2b: Nếu owner email invalid_grant → tìm username@* trong allUsersForSearch
+        // Vòng 2: Reports API → tìm ownerEmail của folderId → impersonate owner
+        // Vòng 2b: Nếu owner email invalid_grant → tìm username@* trong
+        // allUsersForSearch
         // Nếu không tìm được → tiếp tục với adminEmail (kết quả có thể thiếu)
         if (!ownerDetected || ownerEmail.equals(adminEmail)) {
-            pt.log("🔍 Vòng 2: Dùng Reports API để tìm owner của folder ID: " + folderId + "...", ProgressTracker.LogLevel.INFO);
+            pt.log("🔍 Vòng 2: Dùng Reports API để tìm owner của folder ID: " + folderId + "...",
+                    ProgressTracker.LogLevel.INFO);
 
             // ── Vòng 2: Reports API ──────────────────────────────────────────────
             String reportOwner = null;
             try {
-                com.google.auth.oauth2.GoogleCredentials adminCreds =
-                        com.google.auth.oauth2.ServiceAccountCredentials
-                                .fromStream(new FileInputStream(Config.getServiceAccountFile()))
-                                .createScoped(List.of("https://www.googleapis.com/auth/admin.reports.audit.readonly"))
-                                .createDelegated(adminEmail);
-                com.google.api.services.reports.Reports reportsService =
-                        new com.google.api.services.reports.Reports.Builder(
-                                GoogleNetHttpTransport.newTrustedTransport(),
-                                GsonFactory.getDefaultInstance(),
-                                new com.google.auth.http.HttpCredentialsAdapter(adminCreds))
-                                .setApplicationName("Drive Recovery Tool v2.0")
-                                .build();
+                com.google.auth.oauth2.GoogleCredentials adminCreds = com.google.auth.oauth2.ServiceAccountCredentials
+                        .fromStream(new FileInputStream(Config.getServiceAccountFile()))
+                        .createScoped(List.of("https://www.googleapis.com/auth/admin.reports.audit.readonly"))
+                        .createDelegated(adminEmail);
+                com.google.api.services.reports.Reports reportsService = new com.google.api.services.reports.Reports.Builder(
+                        GoogleNetHttpTransport.newTrustedTransport(),
+                        GsonFactory.getDefaultInstance(),
+                        new com.google.auth.http.HttpCredentialsAdapter(adminCreds))
+                        .setApplicationName("Drive Recovery Tool v2.0")
+                        .build();
 
-                com.google.api.services.reports.model.Activities activities =
-                        reportsService.activities()
-                                .list("all", "drive")
-                                .setFilters("doc_id==" + folderId)
-                                .setMaxResults(10)
-                                .execute();
+                com.google.api.services.reports.model.Activities activities = reportsService.activities()
+                        .list("all", "drive")
+                        .setFilters("doc_id==" + folderId)
+                        .setMaxResults(10)
+                        .execute();
 
                 if (activities.getItems() != null) {
-                    outer:
-                    for (com.google.api.services.reports.model.Activity act : activities.getItems()) {
-                        if (act.getEvents() == null) continue;
+                    outer: for (com.google.api.services.reports.model.Activity act : activities.getItems()) {
+                        if (act.getEvents() == null)
+                            continue;
                         for (com.google.api.services.reports.model.Activity.Events event : act.getEvents()) {
-                            if (event.getParameters() == null) continue;
-                            for (com.google.api.services.reports.model.Activity.Events.Parameters param : event.getParameters()) {
-                                if ("owner".equals(param.getName()) && param.getValue() != null && !param.getValue().isBlank()) {
+                            if (event.getParameters() == null)
+                                continue;
+                            for (com.google.api.services.reports.model.Activity.Events.Parameters param : event
+                                    .getParameters()) {
+                                if ("owner".equals(param.getName()) && param.getValue() != null
+                                        && !param.getValue().isBlank()) {
                                     reportOwner = param.getValue();
                                     break outer;
                                 }
@@ -432,11 +453,13 @@ public class TaskRunner extends SwingWorker<Void, String> {
                         if (meta.getName() != null && !meta.getName().isBlank() && folderName.equals(folderId)) {
                             folderName = meta.getName();
                         }
-                        pt.log("✅ Vòng 2: Xác nhận owner qua Reports API → " + ownerEmail, ProgressTracker.LogLevel.SUCCESS);
+                        pt.log("✅ Vòng 2: Xác nhận owner qua Reports API → " + ownerEmail,
+                                ProgressTracker.LogLevel.SUCCESS);
                     }
                 } catch (Exception eOwner) {
                     String msg = eOwner.getMessage() != null ? eOwner.getMessage() : "";
-                    pt.log("⚠️ Vòng 2: Không impersonate được " + reportOwner + ": " + msg, ProgressTracker.LogLevel.WARNING);
+                    pt.log("⚠️ Vòng 2: Không impersonate được " + reportOwner + ": " + msg,
+                            ProgressTracker.LogLevel.WARNING);
 
                     // ── Vòng 2b: invalid_grant → tìm username@* trong allUsersForSearch ──
                     boolean isInvalidUser = msg.contains("invalid_grant") || msg.contains("Invalid email")
@@ -445,9 +468,11 @@ public class TaskRunner extends SwingWorker<Void, String> {
                         final String finalReportOwner = reportOwner; // effectively final for lambda
                         String username = reportOwner.substring(0, reportOwner.indexOf('@'));
                         final String finalUsername = username; // effectively final for lambda
-                        pt.log("🔄 Vòng 2b: tìm user có username '" + username + "' trong tổ chức...", ProgressTracker.LogLevel.INFO);
+                        pt.log("🔄 Vòng 2b: tìm user có username '" + username + "' trong tổ chức...",
+                                ProgressTracker.LogLevel.INFO);
                         List<String> sameUsernameList = Config.getAllUsersForSearch().stream()
-                                .filter(u -> u != null && u.startsWith(finalUsername + "@") && !u.equalsIgnoreCase(finalReportOwner))
+                                .filter(u -> u != null && u.startsWith(finalUsername + "@")
+                                        && !u.equalsIgnoreCase(finalReportOwner))
                                 .collect(java.util.stream.Collectors.toList());
                         for (String altEmail : sameUsernameList) {
                             pt.log("  🔄 Vòng 2b thử: " + altEmail, ProgressTracker.LogLevel.DETAIL);
@@ -460,7 +485,8 @@ public class TaskRunner extends SwingWorker<Void, String> {
                                 if (meta != null) {
                                     ownerEmail = altEmail;
                                     ownerDetected = true;
-                                    if (meta.getName() != null && !meta.getName().isBlank() && folderName.equals(folderId)) {
+                                    if (meta.getName() != null && !meta.getName().isBlank()
+                                            && folderName.equals(folderId)) {
                                         folderName = meta.getName();
                                     }
                                     pt.log("✅ Vòng 2b: Tìm thấy qua " + altEmail, ProgressTracker.LogLevel.SUCCESS);
@@ -471,54 +497,60 @@ public class TaskRunner extends SwingWorker<Void, String> {
                             }
                         }
                         if (!ownerDetected || ownerEmail.equals(adminEmail)) {
-                            pt.log("❌ Vòng 2b: Không tìm thấy user nào có username '" + username + "' có quyền → không tìm thấy folder", ProgressTracker.LogLevel.WARNING);
+                            pt.log("❌ Vòng 2b: Không tìm thấy user nào có username '" + username
+                                    + "' có quyền → không tìm thấy folder", ProgressTracker.LogLevel.WARNING);
                         }
                     }
                 }
             } else {
-                pt.log("⚠️ Reports API không có log cho folder ID này → không tìm được owner", ProgressTracker.LogLevel.WARNING);
+                pt.log("⚠️ Reports API không có log cho folder ID này → không tìm được owner",
+                        ProgressTracker.LogLevel.WARNING);
             }
 
             if (!ownerDetected || ownerEmail.equals(adminEmail)) {
-                pt.log("⚠️ Không tìm được owner → tiếp tục với adminEmail (kết quả có thể thiếu)", ProgressTracker.LogLevel.WARNING);
+                pt.log("⚠️ Không tìm được owner → tiếp tục với adminEmail (kết quả có thể thiếu)",
+                        ProgressTracker.LogLevel.WARNING);
             }
         }
 
-
         // ⭐ BƯỚC 2: Xây dựng search list để tìm file/folder thất lạc
         java.util.List<String> searchList = new java.util.ArrayList<>(Config.getAllUsersForSearch());
-        if (!searchList.contains(ownerEmail)) searchList.add(ownerEmail);
-        if (!searchList.contains(adminEmail)) searchList.add(adminEmail);
+        if (!searchList.contains(ownerEmail))
+            searchList.add(ownerEmail);
+        if (!searchList.contains(adminEmail))
+            searchList.add(adminEmail);
         for (String u : appConfig.selectedUsers) {
-            if (!searchList.contains(u)) searchList.add(u);
+            if (!searchList.contains(u))
+                searchList.add(u);
         }
 
-        // ⭐ FIX: Nếu search list quá ít (<= 2 user) → tự động fetch toàn bộ user từ domain
+        // ⭐ FIX: Nếu search list quá ít (<= 2 user) → tự động fetch toàn bộ user từ
+        // domain
         if (searchList.size() <= 2) {
-            pt.log("⚠️  Search list chỉ có " + searchList.size() + " user — tự động fetch toàn tổ chức...", ProgressTracker.LogLevel.WARNING);
+            pt.log("⚠️  Search list chỉ có " + searchList.size() + " user — tự động fetch toàn tổ chức...",
+                    ProgressTracker.LogLevel.WARNING);
             try {
                 com.google.auth.oauth2.GoogleCredentials creds = ServiceAccountCredentials
                         .fromStream(new FileInputStream(Config.getServiceAccountFile()))
                         .createScoped(List.of("https://www.googleapis.com/auth/admin.directory.user.readonly"))
                         .createDelegated(adminEmail);
 
-                com.google.api.services.directory.Directory adminSdk =
-                        new com.google.api.services.directory.Directory.Builder(
-                                GoogleNetHttpTransport.newTrustedTransport(),
-                                GsonFactory.getDefaultInstance(),
-                                new HttpCredentialsAdapter(creds))
-                                .setApplicationName("Drive Recovery Tool v2.0")
-                                .build();
+                com.google.api.services.directory.Directory adminSdk = new com.google.api.services.directory.Directory.Builder(
+                        GoogleNetHttpTransport.newTrustedTransport(),
+                        GsonFactory.getDefaultInstance(),
+                        new HttpCredentialsAdapter(creds))
+                        .setApplicationName("Drive Recovery Tool v2.0")
+                        .build();
 
                 String pageToken = null;
                 int fetched = 0;
                 do {
-                    com.google.api.services.directory.Directory.Users.List req =
-                            adminSdk.users().list()
-                                    .setCustomer("my_customer")
-                                    .setMaxResults(500)
-                                    .setOrderBy("email");
-                    if (pageToken != null) req.setPageToken(pageToken);
+                    com.google.api.services.directory.Directory.Users.List req = adminSdk.users().list()
+                            .setCustomer("my_customer")
+                            .setMaxResults(500)
+                            .setOrderBy("email");
+                    if (pageToken != null)
+                        req.setPageToken(pageToken);
                     com.google.api.services.directory.model.Users usersResult = req.execute();
                     if (usersResult.getUsers() != null) {
                         for (com.google.api.services.directory.model.User u : usersResult.getUsers()) {
@@ -531,7 +563,8 @@ public class TaskRunner extends SwingWorker<Void, String> {
                     }
                     pageToken = usersResult.getNextPageToken();
                 } while (pageToken != null);
-                pt.log("✅ Đã fetch " + fetched + " users → search list: " + searchList.size() + " users", ProgressTracker.LogLevel.SUCCESS);
+                pt.log("✅ Đã fetch " + fetched + " users → search list: " + searchList.size() + " users",
+                        ProgressTracker.LogLevel.SUCCESS);
             } catch (Exception eFetch) {
                 pt.log("⚠️ Không fetch được users: " + eFetch.getMessage(), ProgressTracker.LogLevel.WARNING);
             }
@@ -543,30 +576,32 @@ public class TaskRunner extends SwingWorker<Void, String> {
 
         pt.log("👤 Impersonate owner  : " + ownerEmail, ProgressTracker.LogLevel.INFO);
         pt.log("🔎 Tìm folder thiếu  : " + Config.getSearchFolders(), ProgressTracker.LogLevel.INFO);
-        pt.log("🔎 Tìm file thiếu    : " + Config.getSearchFiles(),   ProgressTracker.LogLevel.INFO);
+        pt.log("🔎 Tìm file thiếu    : " + Config.getSearchFiles(), ProgressTracker.LogLevel.INFO);
         pt.log("👥 Search list (" + searchList.size() + " user): " + searchList, ProgressTracker.LogLevel.INFO);
 
         checkStopped();
 
-        // Tạo Drive + Activity service với đúng owner — Activity API chỉ thấy activity của user đang impersonate
+        // Tạo Drive + Activity service với đúng owner — Activity API chỉ thấy activity
+        // của user đang impersonate
         Drive driveService = createDriveServiceForUser(ownerEmail);
         DriveActivity activityService = createActivityServiceForUser(ownerEmail);
         logFilterConfig(pt);
 
         DriveRecoveryService recoveryService = new DriveRecoveryService(driveService, activityService);
-        // Truyền folderName (đã lấy qua admin ở BƯỚC 1) → không cần fetch lại trong DriveRecoveryService
+        // Truyền folderName (đã lấy qua admin ở BƯỚC 1) → không cần fetch lại trong
+        // DriveRecoveryService
         String reportPath = recoveryService.processSpecificFolder(folderId, folderName, ownerEmail);
 
         pt.log("\n✅ Hoàn thành! Báo cáo: " + reportPath, ProgressTracker.LogLevel.SUCCESS);
     }
-
 
     // ============================================
     // MODE 3: Detailed Activity - 1 User
     // ============================================
     private void runMode3(ProgressTracker pt) throws Exception {
         String userEmail = Config.getUsersToCheck().isEmpty()
-                ? appConfig.adminEmail : Config.getUsersToCheck().get(0);
+                ? appConfig.adminEmail
+                : Config.getUsersToCheck().get(0);
 
         pt.log("════════════════════════════════════════", ProgressTracker.LogLevel.HEADER);
         pt.log("   🔍 MODE 3: PHÂN TÍCH TẤT CẢ FOLDERS CỦA 1 USER", ProgressTracker.LogLevel.HEADER);
@@ -657,9 +692,11 @@ public class TaskRunner extends SwingWorker<Void, String> {
 
     private String buildServiceAccountJson() {
         String pkId = (Config.getPrivateKeyId() != null && !Config.getPrivateKeyId().isEmpty())
-                ? Config.getPrivateKeyId() : "0";
+                ? Config.getPrivateKeyId()
+                : "0";
         String cid = (Config.getClientId() != null && !Config.getClientId().isEmpty())
-                ? Config.getClientId() : "0";
+                ? Config.getClientId()
+                : "0";
         return String.format("""
                 {
                   "type": "service_account",
@@ -719,6 +756,8 @@ public class TaskRunner extends SwingWorker<Void, String> {
 
     /** Thrown when user requests stop */
     static class StoppedException extends Exception {
-        StoppedException() { super("Stopped by user"); }
+        StoppedException() {
+            super("Stopped by user");
+        }
     }
 }

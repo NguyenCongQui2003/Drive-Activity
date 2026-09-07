@@ -1,0 +1,5 @@
+start=22384, fd=22398, end_catch=28734, end_brace=29063
+--- START CONTEXT ---
+'} else if (fh.deletedFromSubtree && !fh.everInFolder) {\n    '
+--- END CONTEXT ---
+'} catch (Exception e) {\n                            sfInfo.action = "Lỗi: " + e.getMessage();\n                            sfInfo.movedFrom = "-";\n                            pt.log("  │           │    ↳ ❌ Lỗi xử lý: " + e.getMessage(),\n                                    ProgressTracker.LogLevel.ERROR);\n                        }\n'

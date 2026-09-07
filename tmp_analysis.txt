@@ -1,0 +1,9 @@
+=== CASE blocks ===
+  L703: // CASE 1: File đang có trong folder → bỏ qua (không cần gọi thêm API)
+  L715: // CASE 2: File đang trong subfolder → bỏ qua (không cần gọi thêm API)
+  L727: // CASE 2.5: File bị DELETE qua DELETE event — 3-layer resolution
+  L839: // CASE 3: File thiếu → cần tìm & move
+
+=== Status conditions ===
+  L459: } else if (fh.deletedFromSubtree && !fh.everInFolder) {
+  L728: if (fileHistory.deletedFromSubtree && !fileHistory.everInFolder) {

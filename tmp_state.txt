@@ -1,0 +1,39 @@
+--- create_positions ---
+[124929, 134299]
+
+--- folder_delete_pos ---
+22398
+
+--- file_delete_pos ---
+38032
+
+--- create1_snippet ---
+       for (ActionDetail detail : allActions) {
+                // ⭐ CREATE — xử lý giống folder: verify parent bằng Drive API
+                // ancestorName trả về cả subtree → phải check parents thực tế
+                // Bắt: file upload trực tiếp vào folder (không qua MOVE)
+                if (detail.getCreate() != null) {
+                    
+
+--- create2_snippet ---
+ctions) {
+                // ⭐ FIX: Detect CREATE event cho folder trực tiếp trong folderId
+                // ancestorName query trả về cả subtree → phải verify parent thực sự là folderId
+                // Dùng Drive API để check parents (chấp nhận 1 API call cho CREATE event)
+                if (detail.getCreate() != null) {
+                    
+
+--- folder_delete_snippet ---
+
+                                ProgressTracker.LogLevel.INFO);
+
+                    } else if (fh.deletedFromSubtree && !fh.everInFolder) {
+                        // ── BỊ XÓA qua DELETE event ──
+ 
+
+--- file_delete_snippet ---
+  // Logic: Trash → báo cáo; không Trash → move về; 404 → xóa vĩnh viễn
+            if (fileHistory.deletedFromSubtree && !fileHistory.everInFolder) {
+                missingCount++;
+                f
+

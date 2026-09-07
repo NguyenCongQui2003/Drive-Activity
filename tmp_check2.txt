@@ -1,0 +1,8 @@
+2388:                 if (detail.getCreate() != null) {
+2473:                     newFh.deleteType = deleteTypeLocal; // ? NEW
+2479:                     if (deleteTypeLocal != null && fileHistoryMap.get(fileId).deleteType == null) {
+2480:                         fileHistoryMap.get(fileId).deleteType = deleteTypeLocal;
+2589:                 if (detail.getCreate() != null) {
+2675:                     newFh.deleteType = deleteTypeLocal; // ? NEW
+2681:                     if (deleteTypeLocal != null && map.get(foldItemId).deleteType == null) {
+2682:                         map.get(foldItemId).deleteType = deleteTypeLocal;
